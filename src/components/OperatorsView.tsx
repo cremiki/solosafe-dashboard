@@ -7,6 +7,7 @@ import {
 import { supabase } from '../lib/supabase';
 import { DEVICE_ICONS, ICON_PATHS } from '../lib/markerIcons';
 import { generateOnboardingPdf } from '../utils/generateOnboardingPdf';
+import { reverseGeocode } from '../lib/geocoding';
 import OperatorIcon from './OperatorIcon';
 
 const COMPANY_ID = 'c0000000-0000-0000-0000-000000000001';
@@ -220,6 +221,9 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   const [cascadeEdits, setCascadeEdits] = useState<{ rounds?: number; timeout?: number; delay?: number }>({});
   const [savingAlarms, setSavingAlarms] = useState(false);
   const [iconDropdownOpen, setIconDropdownOpen] = useState(false);
+  const [isDirty, setIsDirty] = useState<Record<string, boolean>>({});
+  const [unsavedDialog, setUnsavedDialog] = useState<{ tab: EditTab; nextTab: EditTab } | null>(null);
+  const [addressByOp, setAddressByOp] = useState<Record<string, string>>({});
 
   const fetchStatus = useCallback(async () => {
     const { data: hb } = await supabase
@@ -288,6 +292,45 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     return () => { supabase.removeChannel(ch); };
   }, [fetchOperators, fetchStatus]);
 
+  useEffect(() => {
+    if (!editId || editTab !== 'status') return;
+    const st = statusByOp[editId];
+    if (!st || !st.lat) return;
+    if (addressByOp[editId]) return; // Already loaded
+    (async () => {
+      const addr = await reverseGeocode(st.lat, st.lng);
+      setAddressByOp(prev => ({ ...prev, [editId]: addr }));
+    })();
+  }, [editId, editTab, statusByOp]);
+
+  useEffect(() => {
+    if (!editId) return;
+    const key = `${editId}_${editTab}`;
+    // Tab is dirty if contacts has changes or cascade settings have changes
+    let dirty = false;
+    if (editTab === 'contacts') {
+      const op = operators.find(o => o.id === editId);
+      if (op) {
+        // Check if contacts changed
+        const originalContacts = op.emergency_contacts || [];
+        if (JSON.stringify(form.contacts) !== JSON.stringify(originalContacts)) {
+          dirty = true;
+        }
+        // Check if cascade settings changed
+        if (Object.keys(cascadeEdits).length > 0) {
+          dirty = true;
+        }
+      }
+    } else if (editTab === 'anagrafica' || editTab === 'turni') {
+      // For other tabs, check if form changed
+      const op = operators.find(o => o.id === editId);
+      if (op) {
+        dirty = JSON.stringify(form) !== JSON.stringify(op);
+      }
+    }
+    setIsDirty(prev => ({ ...prev, [key]: dirty }));
+  }, [editId, editTab, form, cascadeEdits, operators]);
+
   function offlineMin(iso?: string) {
     if (!iso) return null;
     return Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
@@ -316,6 +359,15 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   function disabledAlarmCount(opId: string) {
     const p = paramsByOp[opId] || {};
     return ['fall_enabled', 'immobility_enabled', 'malore_enabled'].filter(k => p[k] === 'false').length;
+  }
+
+  function handleTabChange(nextTab: EditTab) {
+    const currentTabKey = `${editId}_${editTab}`;
+    if (isDirty[currentTabKey]) {
+      setUnsavedDialog({ tab: editTab, nextTab });
+    } else {
+      setEditTab(nextTab);
+    }
   }
 
   const filtered = operators.filter(op =>
@@ -384,9 +436,22 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   }
 
   function closeForm() {
+    const key = `${editId}_${editTab}`;
+    if (isDirty[key]) {
+      setUnsavedDialog({ tab: editTab, nextTab: 'anagrafica' });
+    } else {
+      setFormMode(null);
+      setEditId(null);
+      setFormError(null);
+      setIsDirty({});
+    }
+  }
+
+  function doCloseForm() {
     setFormMode(null);
     setEditId(null);
     setFormError(null);
+    setIsDirty({});
   }
 
   function updateForm(patch: Partial<FormState>) {
@@ -515,6 +580,28 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
             const { error: cErr } = await supabase.from('emergency_contacts').insert(contactRowsFull);
             if (cErr) throw cErr;
           }
+        }
+      }
+
+      // Save cascade settings if in edit mode and tab is contacts
+      if (formMode === 'edit' && editTab === 'contacts' && operatorId) {
+        const op = operators.find(o => o.id === operatorId);
+        if (op) {
+          const patch: any = {};
+          if (cascadeEdits.rounds !== undefined && cascadeEdits.rounds !== op.cascade_max_rounds) {
+            patch.cascade_max_rounds = cascadeEdits.rounds;
+          }
+          if (cascadeEdits.timeout !== undefined && cascadeEdits.timeout !== op.cascade_timeout_seconds) {
+            patch.cascade_timeout_seconds = cascadeEdits.timeout;
+          }
+          if (cascadeEdits.delay !== undefined && cascadeEdits.delay !== op.cascade_delay_seconds) {
+            patch.cascade_delay_seconds = cascadeEdits.delay;
+          }
+          if (Object.keys(patch).length > 0) {
+            const { error: cascadeErr } = await supabase.from('operators').update(patch).eq('id', operatorId);
+            if (cascadeErr) throw cascadeErr;
+          }
+          setCascadeEdits({});
         }
       }
 
@@ -747,7 +834,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                   { id: 'status', label: '📊 Stato' },
                   { id: 'pdf', label: '📄 PDF' },
                 ] as const).map(tab => (
-                  <button key={tab.id} onClick={() => setEditTab(tab.id)}
+                  <button key={tab.id} onClick={() => handleTabChange(tab.id)}
                     className="px-3 py-2 text-xs font-semibold whitespace-nowrap"
                     style={{
                       color: editTab === tab.id ? '#ECEFF4' : '#8899AA',
@@ -1055,13 +1142,6 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                           </div>
                         </div>
                       ))}
-                      {Object.keys(cascadeEdits).length > 0 && (
-                        <button onClick={onSave}
-                          className="w-full mt-2 px-3 py-2 rounded-lg text-xs font-bold text-white"
-                          style={{ backgroundColor: '#E63946' }}>
-                          Salva impostazioni cascata
-                        </button>
-                      )}
                     </div>
                   </>
                 );
@@ -1159,7 +1239,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                         </div>
                         <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
                           <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><Battery size={10} /> BATTERIA</div>
-                          <div className="text-base font-bold" style={{ color: (st.battery_phone || 0) < (op?.battery_alert_threshold || 20) ? '#E74C3C' : '#ECEFF4' }}>
+                          <div className="text-base font-bold" style={{ color: batteryColor(st.battery_phone) }}>
                             {st.battery_phone ?? '—'}%
                           </div>
                         </div>
@@ -1171,10 +1251,15 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                         <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
                           <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><MapPin size={10} /> POSIZIONE GPS</div>
                           {st.lat ? (
-                            <a href={`https://maps.google.com/?q=${st.lat},${st.lng}`} target="_blank" rel="noreferrer"
-                               className="text-xs underline" style={{ color: '#3B82F6' }}>
-                              {st.lat.toFixed(5)}, {st.lng.toFixed(5)}
-                            </a>
+                            <div>
+                              <a href={`https://maps.google.com/?q=${st.lat},${st.lng}`} target="_blank" rel="noreferrer"
+                                 className="text-xs underline block" style={{ color: '#3B82F6' }}>
+                                {st.lat.toFixed(5)}, {st.lng.toFixed(5)}
+                              </a>
+                              <div className="text-xs mt-1" style={{ color: '#ECEFF4' }}>
+                                {addressByOp[editId] || '⟳ In caricamento...'}
+                              </div>
+                            </div>
                           ) : <span className="text-xs" style={{ color: '#8899AA' }}>—</span>}
                         </div>
                       </div>
@@ -1189,8 +1274,6 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                       {[
                         { label: 'Modello', value: op?.devices?.model || '—' },
                         { label: 'IMEI', value: op?.devices?.imei || '—' },
-                        { label: 'Certificazione', value: op?.devices?.certification || '—' },
-                        { label: 'Condiviso', value: op?.devices?.is_shared ? 'Sì' : 'No' },
                       ].map(row => (
                         <div key={row.label} className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
                           <div className="text-xs mb-1" style={{ color: '#8899AA' }}>{row.label.toUpperCase()}</div>
@@ -1260,6 +1343,52 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Unsaved changes dialog */}
+      {unsavedDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(0, 0, 0, 0.7)' }}>
+          <div className="rounded-lg p-6 w-full max-w-sm" style={{ backgroundColor: '#1A1D27', border: '1px solid #2A2D3E' }}>
+            <h3 className="text-base font-bold mb-2" style={{ color: '#ECEFF4' }}>⚠️ Modifiche non salvate</h3>
+            <p className="text-sm mb-6" style={{ color: '#8899AA' }}>
+              Hai modifiche non salvate in questo tab. Vuoi salvarle prima di continuare?
+            </p>
+            <div className="flex gap-3">
+              <button onClick={async () => {
+                setSaving(true);
+                try {
+                  await handleSave();
+                  setUnsavedDialog(null);
+                  setEditTab(unsavedDialog.nextTab);
+                } finally {
+                  setSaving(false);
+                }
+              }} disabled={saving}
+                className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-bold text-white"
+                style={{ backgroundColor: '#2ECC71' }}>
+                💾 Salva e continua
+              </button>
+              <button onClick={() => {
+                setIsDirty(prev => ({ ...prev, [`${editId}_${unsavedDialog.tab}`]: false }));
+                setUnsavedDialog(null);
+                if (unsavedDialog.nextTab === 'anagrafica') {
+                  doCloseForm();
+                } else {
+                  setEditTab(unsavedDialog.nextTab);
+                }
+              }}
+                className="flex-1 px-3 py-2.5 rounded-lg text-xs font-bold"
+                style={{ border: '1px solid #2A2D3E', color: '#ECEFF4' }}>
+                🚪 Chiudi senza salvare
+              </button>
+              <button onClick={() => setUnsavedDialog(null)}
+                className="px-3 py-2.5 rounded-lg text-xs font-bold"
+                style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
+                ↩ Annulla
+              </button>
+            </div>
           </div>
         </div>
       )}
