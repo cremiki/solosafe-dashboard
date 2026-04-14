@@ -221,9 +221,12 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   const [cascadeEdits, setCascadeEdits] = useState<{ rounds?: number; timeout?: number; delay?: number }>({});
   const [savingAlarms, setSavingAlarms] = useState(false);
   const [iconDropdownOpen, setIconDropdownOpen] = useState(false);
-  const [isDirty, setIsDirty] = useState<Record<string, boolean>>({});
+  const [isDirty, setIsDirty] = useState(false);
   const [unsavedDialog, setUnsavedDialog] = useState<{ tab: EditTab; nextTab: EditTab } | null>(null);
   const [addressByOp, setAddressByOp] = useState<Record<string, string>>({});
+  const [originalForm, setOriginalForm] = useState<FormState>(emptyForm());
+  const [alarmBufferByOp, setAlarmBufferByOp] = useState<Record<string, Record<string, string>>>({});
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   const fetchStatus = useCallback(async () => {
     const { data: hb } = await supabase
@@ -256,6 +259,39 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     setParamsByOp(pmap);
   }, []);
 
+  const loadAlarmBuffer = useCallback(async (operatorId: string) => {
+    const alarmDefs = [
+      { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: 'true', defVal: '2.5' },
+      { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: 'true', defVal: '90' },
+      { enableKey: 'malore_enabled', valKey: 'malore_angle', def: 'true', defVal: '45' },
+    ];
+    const paramNames = alarmDefs.flatMap(a => [a.enableKey, a.valKey]);
+
+    const { data: logs } = await supabase
+      .from('app_config_log')
+      .select('param_name, new_value, created_at')
+      .eq('operator_id', operatorId)
+      .in('param_name', paramNames)
+      .order('created_at', { ascending: false });
+
+    const buffer: Record<string, string> = {};
+    const seen = new Set<string>();
+    (logs || []).forEach((l: any) => {
+      if (!seen.has(l.param_name)) {
+        buffer[l.param_name] = l.new_value;
+        seen.add(l.param_name);
+      }
+    });
+
+    // Fill in defaults for missing params
+    alarmDefs.forEach(a => {
+      if (!buffer[a.enableKey]) buffer[a.enableKey] = a.def;
+      if (!buffer[a.valKey]) buffer[a.valKey] = a.defVal;
+    });
+
+    setAlarmBufferByOp(prev => ({ ...prev, [operatorId]: buffer }));
+  }, []);
+
   const fetchOperators = useCallback(async () => {
     const { data, error } = await supabase
       .from('operators')
@@ -268,6 +304,71 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     }
     setLoading(false);
   }, []);
+
+  const saveAlarmSettings = useCallback(async (operatorId: string) => {
+    setSavingAlarms(true);
+    try {
+      const buffer = alarmBufferByOp[operatorId] || {};
+      const params = paramsByOp[operatorId] || {};
+      const alarmDefs = [
+        { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: 'true', defVal: '2.5' },
+        { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: 'true', defVal: '90' },
+        { enableKey: 'malore_enabled', valKey: 'malore_angle', def: 'true', defVal: '45' },
+      ];
+
+      const rows: any[] = [];
+      alarmDefs.forEach(a => {
+        const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
+        const newEn = buffer[a.enableKey] ?? curEn;
+        if (newEn !== curEn) {
+          rows.push({
+            operator_id: operatorId,
+            company_id: COMPANY_ID,
+            change_type: 'dashboard',
+            param_name: a.enableKey,
+            old_value: curEn,
+            new_value: newEn,
+          });
+        }
+
+        const curVal = params[a.valKey] || a.defVal;
+        const newVal = buffer[a.valKey] ?? curVal;
+        if (newVal !== curVal) {
+          rows.push({
+            operator_id: operatorId,
+            company_id: COMPANY_ID,
+            change_type: 'dashboard',
+            param_name: a.valKey,
+            old_value: curVal,
+            new_value: newVal,
+          });
+        }
+      });
+
+      if (rows.length > 0) {
+        const { error: logErr } = await supabase.from('app_config_log').insert(rows);
+        if (logErr) throw logErr;
+      }
+
+      // Clear edits and refresh
+      setAlarmEdits({});
+      setAlarmBufferByOp(prev => {
+        const next = { ...prev };
+        delete next[operatorId];
+        return next;
+      });
+      setIsDirty(false);
+      setToast({ message: '✅ Allarmi salvati', type: 'success' });
+      setTimeout(() => setToast(null), 3000);
+
+      await fetchStatus();
+    } catch (err: any) {
+      setToast({ message: '❌ Errore nel salvataggio', type: 'error' });
+      setTimeout(() => setToast(null), 3000);
+    } finally {
+      setSavingAlarms(false);
+    }
+  }, [alarmBufferByOp, paramsByOp, fetchStatus]);
 
   useEffect(() => { fetchOperators(); fetchStatus(); }, [fetchOperators, fetchStatus]);
 
@@ -304,32 +405,27 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   }, [editId, editTab, statusByOp]);
 
   useEffect(() => {
-    if (!editId) return;
-    const key = `${editId}_${editTab}`;
-    // Tab is dirty if contacts has changes or cascade settings have changes
-    let dirty = false;
-    if (editTab === 'contacts') {
-      const op = operators.find(o => o.id === editId);
-      if (op) {
-        // Check if contacts changed
-        const originalContacts = op.emergency_contacts || [];
-        if (JSON.stringify(form.contacts) !== JSON.stringify(originalContacts)) {
-          dirty = true;
-        }
-        // Check if cascade settings changed
-        if (Object.keys(cascadeEdits).length > 0) {
-          dirty = true;
-        }
-      }
-    } else if (editTab === 'anagrafica' || editTab === 'turni') {
-      // For other tabs, check if form changed
-      const op = operators.find(o => o.id === editId);
-      if (op) {
-        dirty = JSON.stringify(form) !== JSON.stringify(op);
-      }
+    if (!editId || editTab !== 'alarms') return;
+    loadAlarmBuffer(editId);
+  }, [editId, editTab, loadAlarmBuffer]);
+
+  // Global isDirty tracking: compare form with originalForm + check alarmEdits/cascadeEdits
+  useEffect(() => {
+    if (!editId || !formMode) {
+      setIsDirty(false);
+      return;
     }
-    setIsDirty(prev => ({ ...prev, [key]: dirty }));
-  }, [editId, editTab, form, cascadeEdits, operators]);
+
+    // Check if form changed from original
+    const formChanged = JSON.stringify(form) !== JSON.stringify(originalForm);
+    // Check if alarms have unsaved edits
+    const alarmsChanged = Object.keys(alarmEdits).length > 0;
+    // Check if cascade settings have unsaved edits
+    const cascadeChanged = Object.keys(cascadeEdits).length > 0;
+
+    const dirty = formChanged || alarmsChanged || cascadeChanged;
+    setIsDirty(dirty);
+  }, [form, originalForm, alarmEdits, cascadeEdits, editId, formMode]);
 
   function offlineMin(iso?: string) {
     if (!iso) return null;
@@ -362,8 +458,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   }
 
   function handleTabChange(nextTab: EditTab) {
-    const currentTabKey = `${editId}_${editTab}`;
-    if (isDirty[currentTabKey]) {
+    if (isDirty) {
       setUnsavedDialog({ tab: editTab, nextTab });
     } else {
       setEditTab(nextTab);
@@ -382,7 +477,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
   }
 
   function openEdit(op: OperatorRow) {
-    setForm({
+    const newForm = {
       name: op.name,
       locale: op.locale || 'it',
       default_preset: op.default_preset || 'WAREHOUSE',
@@ -421,13 +516,16 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
           relation: c.relation || 'manager',
           telegram_chat_id: c.telegram_chat_id,
         })),
-    });
+    };
+    setForm(newForm);
+    setOriginalForm(newForm);
     setEditId(op.id);
     setFormMode('edit');
     setFormError(null);
     setEditTab('anagrafica');
     setAlarmEdits({});
     setCascadeEdits({});
+    setIsDirty(false);
   }
 
   function openEditOnTab(op: OperatorRow, tab: EditTab) {
@@ -435,15 +533,12 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     setTimeout(() => setEditTab(tab), 0);
   }
 
-  function closeForm() {
-    const key = `${editId}_${editTab}`;
-    if (isDirty[key]) {
+  function handleClose() {
+    if (isDirty) {
+      // Show unsaved dialog when trying to close with unsaved changes
       setUnsavedDialog({ tab: editTab, nextTab: 'anagrafica' });
     } else {
-      setFormMode(null);
-      setEditId(null);
-      setFormError(null);
-      setIsDirty({});
+      doCloseForm();
     }
   }
 
@@ -451,7 +546,8 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     setFormMode(null);
     setEditId(null);
     setFormError(null);
-    setIsDirty({});
+    setIsDirty(false);
+    setCascadeEdits({});
   }
 
   function updateForm(patch: Partial<FormState>) {
@@ -605,7 +701,57 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
         }
       }
 
-      closeForm();
+      // Save alarm edits to app_config_log (from any tab)
+      if (formMode === 'edit' && operatorId && Object.keys(alarmEdits).length > 0) {
+        const params = paramsByOp[operatorId] || {};
+        const alarmDefs = [
+          { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: '2.5' },
+          { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: '90' },
+          { enableKey: 'malore_enabled', valKey: 'malore_angle', def: '45' },
+        ];
+        const logRows: any[] = [];
+        alarmDefs.forEach(a => {
+          const curEn = params[a.enableKey] !== 'false';
+          const newEn = alarmEdits[a.enableKey] ?? curEn;
+          if (newEn !== curEn) {
+            logRows.push({
+              operator_id: operatorId,
+              company_id: COMPANY_ID,
+              change_type: 'dashboard',
+              param_name: a.enableKey,
+              old_value: String(curEn),
+              new_value: String(newEn),
+            });
+          }
+          const curVal = params[a.valKey] || a.def;
+          const newVal = String(alarmEdits[a.valKey] ?? curVal);
+          if (newVal !== curVal) {
+            logRows.push({
+              operator_id: operatorId,
+              company_id: COMPANY_ID,
+              change_type: 'dashboard',
+              param_name: a.valKey,
+              old_value: curVal,
+              new_value: newVal,
+            });
+          }
+        });
+        if (logRows.length > 0) {
+          const { error: logErr } = await supabase.from('app_config_log').insert(logRows);
+          if (logErr) throw logErr;
+        }
+      }
+
+      // Mark as saved (not dirty anymore) + reset edits
+      setIsDirty(false);
+      setAlarmEdits({});
+      setCascadeEdits({});
+      setAlarmBufferByOp(prev => {
+        const next = { ...prev };
+        if (operatorId) delete next[operatorId];
+        return next;
+      });
+
       await fetchOperators();
     } catch (err: any) {
       setFormError(err.message || 'Errore durante il salvataggio');
@@ -808,7 +954,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
       {formMode && (
         <div className="fixed inset-0 z-50 flex items-start justify-end"
              style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-             onClick={e => { if (e.target === e.currentTarget) closeForm(); }}>
+             onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
           <div className="w-full max-w-lg h-full overflow-y-auto"
                style={{ backgroundColor: '#1A1D27', borderLeft: '1px solid #2A2D3E' }}>
             {/* Panel header */}
@@ -817,7 +963,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
               <h3 className="text-base font-bold" style={{ color: '#ECEFF4' }}>
                 {formMode === 'create' ? 'Nuovo Operatore' : form.name || 'Modifica Operatore'}
               </h3>
-              <button onClick={closeForm} className="p-1.5 rounded-lg hover:bg-white/5"
+              <button onClick={handleClose} className="p-1.5 rounded-lg hover:bg-white/5"
                       style={{ color: '#8899AA' }}>
                 <X size={20} />
               </button>
@@ -1151,46 +1297,49 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
               {/* TAB: ALARMS */}
               {formMode === 'edit' && editTab === 'alarms' && editId && (() => {
                 const params = paramsByOp[editId] || {};
-                const alarms = [
-                  { name: '🔴 Caduta', enableKey: 'fall_enabled', valKey: 'fall_threshold_g', unit: 'g', def: '2.5', label: 'Soglia G', min: 1.5, max: 4, step: 0.1 },
-                  { name: '🟠 Immobilità', enableKey: 'immobility_enabled', valKey: 'immobility_seconds', unit: 's', def: '90', label: 'Tempo', min: 30, max: 300, step: 10 },
-                  { name: '🟡 Malore', enableKey: 'malore_enabled', valKey: 'malore_angle', unit: '°', def: '45', label: 'Angolazione', min: 20, max: 90, step: 5 },
+                const buffer = alarmBufferByOp[editId] || {};
+                const alarmDefs = [
+                  { name: '🔴 Caduta', enableKey: 'fall_enabled', valKey: 'fall_threshold_g', unit: 'g', def: 'true', defVal: '2.5', label: 'Soglia G', min: 1.5, max: 4, step: 0.1 },
+                  { name: '🟠 Immobilità', enableKey: 'immobility_enabled', valKey: 'immobility_seconds', unit: 's', def: 'true', defVal: '90', label: 'Tempo', min: 30, max: 300, step: 10 },
+                  { name: '🟡 Malore', enableKey: 'malore_enabled', valKey: 'malore_angle', unit: '°', def: 'true', defVal: '45', label: 'Angolazione', min: 20, max: 90, step: 5 },
                 ];
-                const onSave = async () => {
-                  setSavingAlarms(true);
-                  const rows: any[] = [];
-                  alarms.forEach(a => {
-                    const curEn = params[a.enableKey] !== 'false';
-                    const newEn = alarmEdits[a.enableKey] ?? curEn;
-                    if (newEn !== curEn) {
-                      rows.push({ operator_id: editId, company_id: COMPANY_ID, change_type: 'dashboard', param_name: a.enableKey, old_value: String(curEn), new_value: String(newEn) });
-                    }
-                    const curVal = params[a.valKey] || a.def;
-                    const newVal = String(alarmEdits[a.valKey] ?? curVal);
-                    if (newVal !== curVal) {
-                      rows.push({ operator_id: editId, company_id: COMPANY_ID, change_type: 'dashboard', param_name: a.valKey, old_value: curVal, new_value: newVal });
-                    }
-                  });
-                  if (rows.length > 0) {
-                    await supabase.from('app_config_log').insert(rows);
-                    setAlarmEdits({});
-                    fetchStatus();
-                  }
-                  setSavingAlarms(false);
+
+                const handleToggle = (enableKey: string, newValue: boolean) => {
+                  const strVal = String(newValue);
+                  setAlarmBufferByOp(prev => ({ ...prev, [editId]: { ...buffer, [enableKey]: strVal } }));
+                  setAlarmEdits(e => ({ ...e, [enableKey]: newValue }));
                 };
+
+                const handleThresholdChange = (valKey: string, newValue: string) => {
+                  setAlarmBufferByOp(prev => ({ ...prev, [editId]: { ...buffer, [valKey]: newValue } }));
+                  setAlarmEdits(e => ({ ...e, [valKey]: newValue }));
+                };
+
+                // Check if there are modifications
+                let hasChanges = false;
+                alarmDefs.forEach(a => {
+                  const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
+                  const bufEn = buffer[a.enableKey] ?? curEn;
+                  if (bufEn !== curEn) hasChanges = true;
+
+                  const curVal = params[a.valKey] || a.defVal;
+                  const bufVal = buffer[a.valKey] ?? curVal;
+                  if (bufVal !== curVal) hasChanges = true;
+                });
+
                 return (
                   <div className="space-y-3 mt-2">
-                    {alarms.map(a => {
-                      const curEn = params[a.enableKey] !== 'false';
-                      const en = alarmEdits[a.enableKey] ?? curEn;
-                      const curVal = params[a.valKey] || a.def;
-                      const val = alarmEdits[a.valKey] ?? curVal;
+                    {alarmDefs.map(a => {
+                      const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
+                      const en = (buffer[a.enableKey] ?? curEn) === 'true';
+                      const curVal = params[a.valKey] || a.defVal;
+                      const val = buffer[a.valKey] ?? curVal;
                       return (
                         <div key={a.name} className="flex items-center justify-between p-3 rounded-xl"
                              style={{ backgroundColor: en ? 'rgba(46,204,113,0.08)' : 'rgba(231,76,60,0.08)', border: `1px solid ${en ? 'rgba(46,204,113,0.3)' : 'rgba(231,76,60,0.3)'}` }}>
                           <div className="flex items-center gap-3">
                             <span className="text-sm font-bold" style={{ color: '#ECEFF4', minWidth: 110 }}>{a.name}</span>
-                            <button onClick={() => setAlarmEdits(e => ({ ...e, [a.enableKey]: !en }))}
+                            <button onClick={() => handleToggle(a.enableKey, !en)}
                               className="relative inline-flex items-center h-6 w-11 rounded-full"
                               style={{ backgroundColor: en ? '#2ECC71' : '#E74C3C' }}>
                               <span className="inline-block w-4 h-4 rounded-full bg-white"
@@ -1200,7 +1349,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                           <div className="flex items-center gap-1">
                             <span className="text-xs" style={{ color: '#8899AA' }}>{a.label}:</span>
                             <input type="number" value={val} min={a.min} max={a.max} step={a.step} disabled={!en}
-                              onChange={e => setAlarmEdits(ed => ({ ...ed, [a.valKey]: e.target.value }))}
+                              onChange={e => handleThresholdChange(a.valKey, e.target.value)}
                               className="w-20 px-2 py-1 text-xs rounded text-right font-semibold"
                               style={{ backgroundColor: '#0F1117', color: '#ECEFF4', border: '1px solid #2A2D3E', opacity: en ? 1 : 0.5 }} />
                             <span className="text-xs" style={{ color: '#8899AA' }}>{a.unit}</span>
@@ -1212,14 +1361,12 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                       <span className="text-sm font-bold" style={{ color: '#ECEFF4' }}>🆘 SOS</span>
                       <span className="text-xs font-bold px-2 py-0.5 rounded" style={{ backgroundColor: '#2ECC71', color: '#fff' }}>SEMPRE ON</span>
                     </div>
-                    {Object.keys(alarmEdits).length > 0 && (
-                      <button onClick={onSave} disabled={savingAlarms}
-                        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold text-white"
-                        style={{ backgroundColor: '#E63946' }}>
-                        {savingAlarms ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                        Salva modifiche allarmi
-                      </button>
-                    )}
+                    <button onClick={() => saveAlarmSettings(editId)} disabled={!hasChanges || savingAlarms}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold text-white"
+                      style={{ backgroundColor: hasChanges ? '#E63946' : '#4A5568', opacity: hasChanges ? 1 : 0.5, cursor: hasChanges ? 'pointer' : 'not-allowed' }}>
+                      {savingAlarms ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                      Salva modifiche allarmi
+                    </button>
                   </div>
                 );
               })()}
@@ -1336,7 +1483,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                   {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
                   {saving ? 'Salvataggio...' : formMode === 'create' ? 'Crea Operatore' : 'Salva Modifiche'}
                 </button>
-                <button onClick={closeForm}
+                <button onClick={handleClose}
                         className="px-4 py-2.5 rounded-lg text-sm font-medium"
                         style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
                   Annulla
@@ -1353,7 +1500,7 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
           <div className="rounded-lg p-6 w-full max-w-sm" style={{ backgroundColor: '#1A1D27', border: '1px solid #2A2D3E' }}>
             <h3 className="text-base font-bold mb-2" style={{ color: '#ECEFF4' }}>⚠️ Modifiche non salvate</h3>
             <p className="text-sm mb-6" style={{ color: '#8899AA' }}>
-              Hai modifiche non salvate in questo tab. Vuoi salvarle prima di continuare?
+              Hai modifiche non salvate. Vuoi salvarle?
             </p>
             <div className="flex gap-3">
               <button onClick={async () => {
@@ -1361,17 +1508,21 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                 try {
                   await handleSave();
                   setUnsavedDialog(null);
-                  setEditTab(unsavedDialog.nextTab);
+                  if (unsavedDialog.nextTab === 'anagrafica') {
+                    doCloseForm();
+                  } else {
+                    setEditTab(unsavedDialog.nextTab);
+                  }
                 } finally {
                   setSaving(false);
                 }
               }} disabled={saving}
                 className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-bold text-white"
                 style={{ backgroundColor: '#2ECC71' }}>
-                💾 Salva e continua
+                {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                {unsavedDialog.nextTab === 'anagrafica' ? 'Salva e chiudi' : 'Salva e continua'}
               </button>
               <button onClick={() => {
-                setIsDirty(prev => ({ ...prev, [`${editId}_${unsavedDialog.tab}`]: false }));
                 setUnsavedDialog(null);
                 if (unsavedDialog.nextTab === 'anagrafica') {
                   doCloseForm();
@@ -1381,17 +1532,36 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
               }}
                 className="flex-1 px-3 py-2.5 rounded-lg text-xs font-bold"
                 style={{ border: '1px solid #2A2D3E', color: '#ECEFF4' }}>
-                🚪 Chiudi senza salvare
+                Scarta modifiche
               </button>
               <button onClick={() => setUnsavedDialog(null)}
                 className="px-3 py-2.5 rounded-lg text-xs font-bold"
                 style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
-                ↩ Annulla
+                Annulla
               </button>
             </div>
           </div>
         </div>
       )}
+
+      {/* Toast notifications */}
+      {toast && (
+        <div className="fixed bottom-4 right-4 px-4 py-3 rounded-lg text-sm font-bold"
+             style={{
+               backgroundColor: toast.type === 'success' ? '#2ECC71' : '#E74C3C',
+               color: '#fff',
+               zIndex: 9999,
+               animation: 'slideIn 0.3s ease-out',
+             }}>
+          {toast.message}
+        </div>
+      )}
+      <style>{`
+        @keyframes slideIn {
+          from { transform: translateX(400px); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+      `}</style>
     </>
   );
 }
