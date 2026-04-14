@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Plus, Search, Pencil, Trash2, X, Save, Loader2, UserPlus,
+  Plus, Search, Trash2, X, Save, Loader2,
   Phone, Shield, Smartphone, Clock, Users, AlertCircle, ChevronDown, FileText,
-  AlertTriangle, Activity, SlidersHorizontal, Battery, MapPin, RotateCcw
+  AlertTriangle, Activity, SlidersHorizontal, Battery, MapPin
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { DEVICE_ICONS, ICON_PATHS } from '../lib/markerIcons';
@@ -12,7 +12,10 @@ import OperatorIcon from './OperatorIcon';
 
 const COMPANY_ID = 'c0000000-0000-0000-0000-000000000001';
 
-// Types
+// ============================================================================
+// TYPES
+// ============================================================================
+
 interface EmergencyContact {
   id?: string;
   position: number;
@@ -53,7 +56,6 @@ interface OperatorRow {
   cascade_timeout_seconds?: number;
   cascade_delay_seconds?: number;
   battery_alert_threshold?: number;
-  default_session_hours?: number;
   birth_date?: string | null;
   notes?: string | null;
   icon_name?: string;
@@ -61,33 +63,75 @@ interface OperatorRow {
   email?: string | null;
   phone_number?: string | null;
   badge_number?: string | null;
-  shared_device?: boolean;
 }
+
+type EditTab = 'anagrafica' | 'turni' | 'alarms' | 'contacts' | 'status' | 'pdf';
+type FormMode = null | 'create' | 'edit';
+
+interface AnagraficaData {
+  name: string;
+  icon_name: string;
+  app_language: string;
+  email: string;
+  phone_number: string;
+  badge_number: string;
+  birth_date: string;
+  notes: string;
+  device: DeviceInfo;
+}
+
+interface TurniData {
+  default_preset: string;
+  default_session_type: string;
+  default_duration_hours: number;
+  allow_preset_change: boolean;
+  login_pin: string;
+  duress_pin: string;
+}
+
+interface CascadeData {
+  rounds: number;
+  timeout: number;
+  delay: number;
+}
+
+interface OperatorEditBuffer {
+  operatorId: string | null;
+  mode: FormMode;
+  anagrafica: AnagraficaData | null;
+  turni: TurniData | null;
+  alarms: Record<string, string>;
+  contacts: EmergencyContact[];
+  cascade: CascadeData | null;
+}
+
+interface OperatorStatus {
+  operator_id: string;
+  state: string;
+  battery_phone: number | null;
+  is_charging: boolean;
+  last_seen: string;
+  last_lat: number | null;
+  last_lng: number | null;
+  session_id?: string;
+  updated_at: string;
+  created_at?: string;
+}
+
+// ============================================================================
+// CONSTANTS & HELPERS
+// ============================================================================
 
 const PRESET_COLORS: Record<string, string> = {
   OFFICE: '#3B82F6', WAREHOUSE: '#9B59B6', CONSTRUCTION: '#F39C12',
   INDUSTRY: '#E74C3C', ALTITUDE: '#1ABC9C', VEHICLE: '#2ECC71',
 };
 
-type EditTab = 'anagrafica' | 'turni' | 'alarms' | 'contacts' | 'status' | 'pdf';
-
-type FormMode = null | 'create' | 'edit';
-
 const PRESETS = ['OFFICE', 'WAREHOUSE', 'CONSTRUCTION', 'INDUSTRY', 'VEHICLE', 'ALTITUDE'];
 const SESSION_TYPES = [
   { value: 'turno', label: 'Turno' },
   { value: 'intervento', label: 'Intervento' },
   { value: 'continua', label: 'Continua' },
-];
-const CERTIFICATIONS = [
-  { value: 'basic', label: 'Basic' },
-  { value: 'compatible', label: 'Compatible' },
-  { value: 'certified', label: 'Certified' },
-];
-const CHANNELS = [
-  { value: 'sms', label: 'SMS' },
-  { value: 'telegram', label: 'Telegram' },
-  { value: 'whatsapp', label: 'WhatsApp' },
 ];
 
 const emptyContact = (): EmergencyContact => ({
@@ -111,47 +155,17 @@ const emptyDevice = (): DeviceInfo => ({
   icon_type: 'shield',
 });
 
-interface FormState {
-  name: string;
-  locale: string;
-  default_preset: string;
-  default_session_type: string;
-  default_duration_hours: number;
-  allow_preset_change: boolean;
-  login_pin: string;
-  duress_pin: string;
-  device: DeviceInfo;
-  contacts: EmergencyContact[];
-  birth_date: string;
-  notes: string;
-  icon_name: string;
-  app_language: string;
-  email: string;
-  phone_number: string;
-  badge_number: string;
-}
-
-const emptyForm = (): FormState => ({
-  name: '',
-  locale: 'it',
-  default_preset: 'WAREHOUSE',
-  default_session_type: 'turno',
-  default_duration_hours: 8,
-  allow_preset_change: false,
-  login_pin: '',
-  duress_pin: '',
-  device: emptyDevice(),
+const emptyEditBuffer = (): OperatorEditBuffer => ({
+  operatorId: null,
+  mode: null,
+  anagrafica: null,
+  turni: null,
+  alarms: {},
   contacts: [],
-  birth_date: '',
-  notes: '',
-  icon_name: 'shield',
-  app_language: 'it',
-  email: '',
-  phone_number: '',
-  badge_number: '',
+  cascade: null,
 });
 
-// Styled input components
+// Styled components
 function Input({ label, ...props }: { label: string } & React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <div>
@@ -199,190 +213,100 @@ function SectionTitle({ icon, title }: { icon: React.ReactNode; title: string })
   );
 }
 
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
 interface OperatorsViewProps {
   pendingOpen?: { id: string; tab: 'status' | 'alarms' } | null;
   onOpenHandled?: () => void;
 }
 
 export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsViewProps = {}) {
+  // Global data
   const [operators, setOperators] = useState<OperatorRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [formMode, setFormMode] = useState<FormMode>(null);
-  const [editId, setEditId] = useState<string | null>(null);
-  const [form, setForm] = useState<FormState>(emptyForm());
+  const [statusByOp, setStatusByOp] = useState<Record<string, OperatorStatus>>({});
+  const [paramsByOp, setParamsByOp] = useState<Record<string, Record<string, string>>>({});
+  const [addressByOp, setAddressByOp] = useState<Record<string, string>>({});
+
+  // Edit panel state
+  const [editBuffer, setEditBuffer] = useState<OperatorEditBuffer>(emptyEditBuffer());
+  const [editTab, setEditTab] = useState<EditTab>('anagrafica');
+  const [dirtyTabs, setDirtyTabs] = useState<Record<EditTab, boolean>>({
+    anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false,
+  });
+
+  // UI state
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [unsavedDialog, setUnsavedDialog] = useState<{ nextTab: EditTab } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-  const [editTab, setEditTab] = useState<EditTab>('anagrafica');
-  const [statusByOp, setStatusByOp] = useState<Record<string, any>>({});
-  const [paramsByOp, setParamsByOp] = useState<Record<string, Record<string, string>>>({});
-  const [alarmEdits, setAlarmEdits] = useState<Record<string, any>>({});
-  const [cascadeEdits, setCascadeEdits] = useState<{ rounds?: number; timeout?: number; delay?: number }>({});
-  const [savingAlarms, setSavingAlarms] = useState(false);
-  const [iconDropdownOpen, setIconDropdownOpen] = useState(false);
-  const [isDirty, setIsDirty] = useState(false);
-  const [unsavedDialog, setUnsavedDialog] = useState<{ tab: EditTab; nextTab: EditTab } | null>(null);
-  const [addressByOp, setAddressByOp] = useState<Record<string, string>>({});
-  const [originalForm, setOriginalForm] = useState<FormState>(emptyForm());
-  const [alarmBufferByOp, setAlarmBufferByOp] = useState<Record<string, Record<string, string>>>({});
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
-  const fetchStatus = useCallback(async () => {
-    const { data: hb } = await supabase
-      .from('operator_status')
-      .select('operator_id, state, battery_phone, is_charging, last_seen, last_lat, last_lng, session_id, updated_at');
-    const map: Record<string, any> = {};
-    (hb || []).forEach((h: any) => {
-      // Normalize column names so the rest of the code stays the same
-      map[h.operator_id] = {
-        ...h,
-        battery_phone: h.battery_phone,
-        charging: h.is_charging,
-        lat: h.last_lat,
-        lng: h.last_lng,
-        created_at: h.last_seen || h.updated_at,
-      };
-    });
-    setStatusByOp(map);
-
-    const { data: logs } = await supabase
-      .from('app_config_log')
-      .select('operator_id, param_name, new_value, created_at')
-      .order('created_at', { ascending: false })
-      .limit(500);
-    const pmap: Record<string, Record<string, string>> = {};
-    (logs || []).forEach((l: any) => {
-      if (!pmap[l.operator_id]) pmap[l.operator_id] = {};
-      if (!pmap[l.operator_id][l.param_name]) pmap[l.operator_id][l.param_name] = l.new_value;
-    });
-    setParamsByOp(pmap);
-  }, []);
-
-  const loadAlarmBuffer = useCallback(async (operatorId: string) => {
-    const alarmDefs = [
-      { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: 'true', defVal: '2.5' },
-      { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: 'true', defVal: '90' },
-      { enableKey: 'malore_enabled', valKey: 'malore_angle', def: 'true', defVal: '45' },
-    ];
-    const paramNames = alarmDefs.flatMap(a => [a.enableKey, a.valKey]);
-
-    const { data: logs } = await supabase
-      .from('app_config_log')
-      .select('param_name, new_value, created_at')
-      .eq('operator_id', operatorId)
-      .in('param_name', paramNames)
-      .order('created_at', { ascending: false });
-
-    const buffer: Record<string, string> = {};
-    const seen = new Set<string>();
-    (logs || []).forEach((l: any) => {
-      if (!seen.has(l.param_name)) {
-        buffer[l.param_name] = l.new_value;
-        seen.add(l.param_name);
-      }
-    });
-
-    // Fill in defaults for missing params
-    alarmDefs.forEach(a => {
-      if (!buffer[a.enableKey]) buffer[a.enableKey] = a.def;
-      if (!buffer[a.valKey]) buffer[a.valKey] = a.defVal;
-    });
-
-    setAlarmBufferByOp(prev => ({ ...prev, [operatorId]: buffer }));
-  }, []);
+  // ========================================================================
+  // DATA LOADING
+  // ========================================================================
 
   const fetchOperators = useCallback(async () => {
     const { data, error } = await supabase
       .from('operators')
-      .select('*, devices(*), emergency_contacts(*), config_token_permanent, birth_date, notes, icon_name, app_language, email, phone_number, badge_number, shared_device')
+      .select('*, devices(*), emergency_contacts(*), birth_date, notes, icon_name, app_language, email, phone_number, badge_number')
       .eq('company_id', COMPANY_ID)
       .order('name');
-
     if (!error && data) {
       setOperators(data as OperatorRow[]);
     }
     setLoading(false);
   }, []);
 
-  const saveAlarmSettings = useCallback(async (operatorId: string) => {
-    setSavingAlarms(true);
-    try {
-      const buffer = alarmBufferByOp[operatorId] || {};
-      const params = paramsByOp[operatorId] || {};
-      const alarmDefs = [
-        { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: 'true', defVal: '2.5' },
-        { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: 'true', defVal: '90' },
-        { enableKey: 'malore_enabled', valKey: 'malore_angle', def: 'true', defVal: '45' },
-      ];
+  const fetchStatus = useCallback(async () => {
+    const { data: hb } = await supabase
+      .from('operator_status')
+      .select('operator_id, state, battery_phone, is_charging, last_seen, last_lat, last_lng, session_id, updated_at');
+    const map: Record<string, OperatorStatus> = {};
+    (hb || []).forEach((h: any) => {
+      map[h.operator_id] = {
+        operator_id: h.operator_id,
+        state: h.state,
+        battery_phone: h.battery_phone,
+        is_charging: h.is_charging,
+        last_seen: h.last_seen,
+        last_lat: h.last_lat,
+        last_lng: h.last_lng,
+        session_id: h.session_id,
+        updated_at: h.updated_at,
+        created_at: h.last_seen || h.updated_at,
+      };
+    });
+    setStatusByOp(map);
 
-      const rows: any[] = [];
-      alarmDefs.forEach(a => {
-        const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
-        const newEn = buffer[a.enableKey] ?? curEn;
-        if (newEn !== curEn) {
-          rows.push({
-            operator_id: operatorId,
-            company_id: COMPANY_ID,
-            change_type: 'dashboard',
-            param_name: a.enableKey,
-            old_value: curEn,
-            new_value: newEn,
-          });
-        }
+    // Load alarm params — DISTINCT ON param_name, latest value
+    const { data: logs } = await supabase
+      .from('app_config_log')
+      .select('operator_id, param_name, new_value, created_at')
+      .order('created_at', { ascending: false });
 
-        const curVal = params[a.valKey] || a.defVal;
-        const newVal = buffer[a.valKey] ?? curVal;
-        if (newVal !== curVal) {
-          rows.push({
-            operator_id: operatorId,
-            company_id: COMPANY_ID,
-            change_type: 'dashboard',
-            param_name: a.valKey,
-            old_value: curVal,
-            new_value: newVal,
-          });
-        }
-      });
-
-      if (rows.length > 0) {
-        const { error: logErr } = await supabase.from('app_config_log').insert(rows);
-        if (logErr) throw logErr;
+    const pmap: Record<string, Record<string, string>> = {};
+    const seen: Set<string> = new Set();
+    (logs || []).forEach((l: any) => {
+      const key = `${l.operator_id}|${l.param_name}`;
+      if (!seen.has(key)) {
+        if (!pmap[l.operator_id]) pmap[l.operator_id] = {};
+        pmap[l.operator_id][l.param_name] = l.new_value;
+        seen.add(key);
       }
+    });
+    setParamsByOp(pmap);
+  }, []);
 
-      // Clear edits and refresh
-      setAlarmEdits({});
-      setAlarmBufferByOp(prev => {
-        const next = { ...prev };
-        delete next[operatorId];
-        return next;
-      });
-      setIsDirty(false);
-      setToast({ message: '✅ Allarmi salvati', type: 'success' });
-      setTimeout(() => setToast(null), 3000);
-
-      await fetchStatus();
-    } catch (err: any) {
-      setToast({ message: '❌ Errore nel salvataggio', type: 'error' });
-      setTimeout(() => setToast(null), 3000);
-    } finally {
-      setSavingAlarms(false);
-    }
-  }, [alarmBufferByOp, paramsByOp, fetchStatus]);
-
-  useEffect(() => { fetchOperators(); fetchStatus(); }, [fetchOperators, fetchStatus]);
-
-  // Handle deep-link from FleetView
   useEffect(() => {
-    if (!pendingOpen || operators.length === 0) return;
-    const op = operators.find(o => o.id === pendingOpen.id);
-    if (op) {
-      openEditOnTab(op, pendingOpen.tab);
-      onOpenHandled?.();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingOpen, operators]);
+    fetchOperators();
+    fetchStatus();
+  }, [fetchOperators, fetchStatus]);
 
+  // Realtime subscriptions
   useEffect(() => {
     const ch = supabase.channel('operators_view_rt')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'operator_status' }, () => fetchStatus())
@@ -393,44 +317,131 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     return () => { supabase.removeChannel(ch); };
   }, [fetchOperators, fetchStatus]);
 
+  // Load geocoding on status tab
   useEffect(() => {
-    if (!editId || editTab !== 'status') return;
-    const st = statusByOp[editId];
-    if (!st || !st.lat) return;
-    if (addressByOp[editId]) return; // Already loaded
+    if (!editBuffer.operatorId || editTab !== 'status') return;
+    const st = statusByOp[editBuffer.operatorId];
+    if (!st?.last_lat || !st?.last_lng) return;
+    if (addressByOp[editBuffer.operatorId]) return;
     (async () => {
-      const addr = await reverseGeocode(st.lat, st.lng);
-      setAddressByOp(prev => ({ ...prev, [editId]: addr }));
+      const addr = await reverseGeocode(st.last_lat!, st.last_lng!);
+      setAddressByOp(prev => ({ ...prev, [editBuffer.operatorId!]: addr }));
     })();
-  }, [editId, editTab, statusByOp]);
+  }, [editBuffer.operatorId, editTab, statusByOp]);
+
+  // FIX 2: Ensure buffer is fresh when operator opens or paramsByOp updates from DB
+  useEffect(() => {
+    if (!editBuffer.operatorId) return;
+
+    // Reload alarm buffer from DB when operator changes or DB updates
+    const opParams = paramsByOp[editBuffer.operatorId] || {};
+    const freshAlarmBuffer = {
+      fall_enabled: opParams.fall_enabled || 'true',
+      fall_threshold_g: opParams.fall_threshold_g || '2.5',
+      immobility_enabled: opParams.immobility_enabled || 'true',
+      immobility_seconds: opParams.immobility_seconds || '90',
+      malore_enabled: opParams.malore_enabled || 'true',
+      malore_angle: opParams.malore_angle || '45',
+    };
+
+    // Only update if buffer alarms differ from fresh DB values
+    if (JSON.stringify(editBuffer.alarms) !== JSON.stringify(freshAlarmBuffer)) {
+      setEditBuffer(prev => ({ ...prev, alarms: freshAlarmBuffer }));
+    }
+  }, [editBuffer.operatorId, paramsByOp]);
+
+  // ========================================================================
+  // DIRTY TABS TRACKING
+  // ========================================================================
 
   useEffect(() => {
-    if (!editId || editTab !== 'alarms') return;
-    loadAlarmBuffer(editId);
-  }, [editId, editTab, loadAlarmBuffer]);
-
-  // Global isDirty tracking: compare form with originalForm + check alarmEdits/cascadeEdits
-  useEffect(() => {
-    if (!editId || !formMode) {
-      setIsDirty(false);
+    if (!editBuffer.operatorId) {
+      setDirtyTabs({ anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false });
       return;
     }
 
-    // Check if form changed from original
-    const formChanged = JSON.stringify(form) !== JSON.stringify(originalForm);
-    // Check if alarms have unsaved edits
-    const alarmsChanged = Object.keys(alarmEdits).length > 0;
-    // Check if cascade settings have unsaved edits
-    const cascadeChanged = Object.keys(cascadeEdits).length > 0;
+    const op = operators.find(o => o.id === editBuffer.operatorId);
+    if (!op) return;
 
-    const dirty = formChanged || alarmsChanged || cascadeChanged;
-    setIsDirty(dirty);
-  }, [form, originalForm, alarmEdits, cascadeEdits, editId, formMode]);
+    // Check anagrafica
+    let anaIsDirty = false;
+    if (editBuffer.anagrafica) {
+      anaIsDirty = editBuffer.anagrafica.name !== op.name ||
+                   editBuffer.anagrafica.icon_name !== (op.icon_name || 'shield') ||
+                   editBuffer.anagrafica.app_language !== (op.app_language || 'it') ||
+                   editBuffer.anagrafica.email !== (op.email || '') ||
+                   editBuffer.anagrafica.phone_number !== (op.phone_number || '') ||
+                   editBuffer.anagrafica.badge_number !== (op.badge_number || '') ||
+                   editBuffer.anagrafica.birth_date !== (op.birth_date || '') ||
+                   editBuffer.anagrafica.notes !== (op.notes || '') ||
+                   JSON.stringify(editBuffer.anagrafica.device) !== JSON.stringify(op.devices || emptyDevice());
+    }
 
-  function offlineMin(iso?: string) {
+    // Check turni
+    let turniIsDirty = false;
+    if (editBuffer.turni) {
+      turniIsDirty = editBuffer.turni.default_preset !== op.default_preset ||
+                     editBuffer.turni.default_session_type !== op.default_session_type ||
+                     editBuffer.turni.default_duration_hours !== op.default_duration_hours ||
+                     editBuffer.turni.allow_preset_change !== op.allow_preset_change ||
+                     editBuffer.turni.login_pin !== (op.login_pin || '') ||
+                     editBuffer.turni.duress_pin !== (op.duress_pin || '');
+    }
+
+    // Check alarms — compare buffer values with paramsByOp (current DB values)
+    const params = paramsByOp[editBuffer.operatorId] || {};
+    const alarmDefs = [
+      { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', defEn: 'true', defVal: '2.5' },
+      { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', defEn: 'true', defVal: '90' },
+      { enableKey: 'malore_enabled', valKey: 'malore_angle', defEn: 'true', defVal: '45' },
+    ];
+    let alarmsIsDirty = false;
+    alarmDefs.forEach(a => {
+      const bufferEn = editBuffer.alarms[a.enableKey] !== undefined ? editBuffer.alarms[a.enableKey] : (params[a.enableKey] || a.defEn);
+      const bufferVal = editBuffer.alarms[a.valKey] !== undefined ? editBuffer.alarms[a.valKey] : (params[a.valKey] || a.defVal);
+      const dbEn = params[a.enableKey] || a.defEn;
+      const dbVal = params[a.valKey] || a.defVal;
+      if (bufferEn !== dbEn || bufferVal !== dbVal) {
+        alarmsIsDirty = true;
+      }
+    });
+
+    // Check contacts
+    const contactsIsDirty = JSON.stringify(editBuffer.contacts) !== JSON.stringify(op.emergency_contacts || []);
+
+    // Check cascade
+    let cascadeIsDirty = false;
+    if (editBuffer.cascade) {
+      cascadeIsDirty = editBuffer.cascade.rounds !== (op.cascade_max_rounds || 2) ||
+                       editBuffer.cascade.timeout !== (op.cascade_timeout_seconds || 25) ||
+                       editBuffer.cascade.delay !== (op.cascade_delay_seconds || 10);
+    }
+
+    setDirtyTabs(prev => ({
+      ...prev,
+      anagrafica: anaIsDirty,
+      turni: turniIsDirty,
+      alarms: alarmsIsDirty,
+      contacts: contactsIsDirty || cascadeIsDirty,
+      status: false,
+      pdf: false,
+    }));
+  }, [editBuffer, operators]);
+
+  // ========================================================================
+  // HELPER FUNCTIONS
+  // ========================================================================
+
+  function disabledAlarmCount(opId: string): number {
+    const p = paramsByOp[opId] || {};
+    return ['fall_enabled', 'immobility_enabled', 'malore_enabled'].filter(k => p[k] === 'false').length;
+  }
+
+  function offlineMin(iso?: string): number | null {
     if (!iso) return null;
     return Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
   }
+
   function statusFor(opId: string) {
     const st = statusByOp[opId];
     if (!st) return { color: '#6B7280', label: '⚫ Offline', state: 'offline' };
@@ -440,226 +451,256 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
     if (st.state === 'protected') return { color: '#2ECC71', label: '🟢 Protetto', state: 'protected' };
     return { color: '#8899AA', label: '⚪ Standby', state: 'standby' };
   }
-  function batteryColor(pct: number | null | undefined) {
+
+  function batteryColor(pct: number | null | undefined): string {
     if (pct == null) return '#4A5568';
     if (pct < 20) return '#E74C3C';
     if (pct < 50) return '#F39C12';
     return '#2ECC71';
   }
-  function heartbeatColor(min: number | null) {
+
+  function heartbeatColor(min: number | null): string {
     if (min == null) return '#4A5568';
     if (min < 10) return '#2ECC71';
     if (min < 30) return '#F39C12';
     return '#E74C3C';
   }
-  function disabledAlarmCount(opId: string) {
-    const p = paramsByOp[opId] || {};
-    return ['fall_enabled', 'immobility_enabled', 'malore_enabled'].filter(k => p[k] === 'false').length;
-  }
 
-  function handleTabChange(nextTab: EditTab) {
-    if (isDirty) {
-      setUnsavedDialog({ tab: editTab, nextTab });
-    } else {
-      setEditTab(nextTab);
-    }
-  }
+  // ========================================================================
+  // EDIT BUFFER OPERATIONS
+  // ========================================================================
 
-  const filtered = operators.filter(op =>
-    op.name.toLowerCase().includes(search.toLowerCase())
-  );
-
-  function openCreate() {
-    setForm(emptyForm());
-    setEditId(null);
-    setFormMode('create');
-    setFormError(null);
-  }
-
-  function openEdit(op: OperatorRow) {
-    const newForm = {
-      name: op.name,
-      locale: op.locale || 'it',
-      default_preset: op.default_preset || 'WAREHOUSE',
-      default_session_type: op.default_session_type || 'turno',
-      default_duration_hours: op.default_duration_hours || 8,
-      allow_preset_change: op.allow_preset_change || false,
-      login_pin: op.login_pin || '',
-      duress_pin: op.duress_pin || '',
-      birth_date: op.birth_date || '',
-      notes: op.notes || '',
-      icon_name: op.icon_name || 'shield',
-      app_language: op.app_language || op.locale || 'it',
-      email: op.email || '',
-      phone_number: op.phone_number || '',
-      badge_number: op.badge_number || '',
-      device: op.devices ? {
-        id: op.devices.id,
-        model: op.devices.model || '',
-        imei: op.devices.imei || '',
-        is_shared: op.devices.is_shared || false,
-        certification: (op.devices.certification as DeviceInfo['certification']) || 'basic',
-        icon_type: op.devices.icon_type || 'shield',
-      } : emptyDevice(),
-      contacts: (op.emergency_contacts || [])
-        .sort((a, b) => a.position - b.position)
-        .map(c => ({
-          id: c.id,
-          position: c.position,
-          name: c.name,
-          phone: c.phone,
-          preferred_channel: c.preferred_channel as EmergencyContact['preferred_channel'],
-          dtmf_required: c.dtmf_required,
-          sms_enabled: c.sms_enabled ?? true,
-          telegram_enabled: c.telegram_enabled ?? true,
-          call_enabled: c.call_enabled ?? true,
-          relation: c.relation || 'manager',
-          telegram_chat_id: c.telegram_chat_id,
-        })),
+  function loadOperatorToBuffer(op: OperatorRow, mode: FormMode) {
+    // Load alarm parameters from paramsByOp (app_config_log latest values)
+    // Convert numeric strings to Numbers to prevent auto-increment bugs
+    const opParams = paramsByOp[op.id] || {};
+    const alarmBuffer = {
+      fall_enabled: opParams.fall_enabled || 'true',
+      fall_threshold_g: String(Number(opParams.fall_threshold_g || '2.5')),
+      immobility_enabled: opParams.immobility_enabled || 'true',
+      immobility_seconds: String(Number(opParams.immobility_seconds || '90')),
+      malore_enabled: opParams.malore_enabled || 'true',
+      malore_angle: String(Number(opParams.malore_angle || '45')),
     };
-    setForm(newForm);
-    setOriginalForm(newForm);
-    setEditId(op.id);
-    setFormMode('edit');
-    setFormError(null);
+
+    setEditBuffer({
+      operatorId: op.id,
+      mode,
+      anagrafica: {
+        name: op.name,
+        icon_name: op.icon_name || 'shield',
+        app_language: op.app_language || 'it',
+        email: op.email || '',
+        phone_number: op.phone_number || '',
+        badge_number: op.badge_number || '',
+        birth_date: op.birth_date || '',
+        notes: op.notes || '',
+        device: op.devices || emptyDevice(),
+      },
+      turni: {
+        default_preset: op.default_preset || 'WAREHOUSE',
+        default_session_type: op.default_session_type || 'turno',
+        default_duration_hours: op.default_duration_hours || 8,
+        allow_preset_change: op.allow_preset_change || false,
+        login_pin: op.login_pin || '',
+        duress_pin: op.duress_pin || '',
+      },
+      alarms: alarmBuffer,
+      contacts: (op.emergency_contacts || []).sort((a, b) => a.position - b.position),
+      cascade: {
+        rounds: op.cascade_max_rounds || 2,
+        timeout: op.cascade_timeout_seconds || 25,
+        delay: op.cascade_delay_seconds || 10,
+      },
+    });
     setEditTab('anagrafica');
-    setAlarmEdits({});
-    setCascadeEdits({});
-    setIsDirty(false);
+    setDirtyTabs({ anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false });
   }
 
-  function openEditOnTab(op: OperatorRow, tab: EditTab) {
-    openEdit(op);
-    setTimeout(() => setEditTab(tab), 0);
+  function updateAnagrafica(patch: Partial<AnagraficaData>) {
+    setEditBuffer(prev => ({
+      ...prev,
+      anagrafica: prev.anagrafica ? { ...prev.anagrafica, ...patch } : null,
+    }));
   }
 
-  function handleClose() {
-    if (isDirty) {
-      // Show unsaved dialog when trying to close with unsaved changes
-      setUnsavedDialog({ tab: editTab, nextTab: 'anagrafica' });
-    } else {
-      doCloseForm();
-    }
+  function updateTurni(patch: Partial<TurniData>) {
+    setEditBuffer(prev => ({
+      ...prev,
+      turni: prev.turni ? { ...prev.turni, ...patch } : null,
+    }));
   }
 
-  function doCloseForm() {
-    setFormMode(null);
-    setEditId(null);
-    setFormError(null);
-    setIsDirty(false);
-    setCascadeEdits({});
+  function updateAlarms(paramName: string, value: string) {
+    setEditBuffer(prev => ({
+      ...prev,
+      alarms: { ...prev.alarms, [paramName]: value },
+    }));
   }
 
-  function updateForm(patch: Partial<FormState>) {
-    setForm(prev => ({ ...prev, ...patch }));
-  }
-
-  function updateDevice(patch: Partial<DeviceInfo>) {
-    setForm(prev => ({ ...prev, device: { ...prev.device, ...patch } }));
+  function updateCascade(patch: Partial<CascadeData>) {
+    setEditBuffer(prev => ({
+      ...prev,
+      cascade: prev.cascade ? { ...prev.cascade, ...patch } : null,
+    }));
   }
 
   function addContact() {
-    if (form.contacts.length >= 5) return;
-    setForm(prev => ({
+    if (editBuffer.contacts.length >= 5) return;
+    setEditBuffer(prev => ({
       ...prev,
       contacts: [...prev.contacts, { ...emptyContact(), position: prev.contacts.length + 1 }],
     }));
   }
 
   function removeContact(idx: number) {
-    setForm(prev => ({
+    setEditBuffer(prev => ({
       ...prev,
       contacts: prev.contacts.filter((_, i) => i !== idx).map((c, i) => ({ ...c, position: i + 1 })),
     }));
   }
 
   function updateContact(idx: number, patch: Partial<EmergencyContact>) {
-    setForm(prev => ({
+    setEditBuffer(prev => ({
       ...prev,
       contacts: prev.contacts.map((c, i) => i === idx ? { ...c, ...patch } : c),
     }));
   }
 
-  async function handleSave() {
-    if (!form.name.trim()) {
-      setFormError('Il nome è obbligatorio');
-      return;
-    }
-    setSaving(true);
-    setFormError(null);
+  // ========================================================================
+  // SAVE LOGIC — UNIFIED
+  // ========================================================================
+
+  async function saveTab(tab: EditTab): Promise<boolean> {
+    if (!editBuffer.operatorId) return false;
+    const op = operators.find(o => o.id === editBuffer.operatorId);
+    if (!op) return false;
 
     try {
-      // Device: create or update
-      let deviceId: string | null = null;
-      if (form.device.model || form.device.imei) {
-        if (form.device.id) {
-          await supabase.from('devices').update({
-            model: form.device.model || null,
-            imei: form.device.imei || null,
-            is_shared: form.device.is_shared,
-            certification: form.device.certification,
-            icon_type: form.device.icon_type,
-          }).eq('id', form.device.id);
-          deviceId = form.device.id;
-        } else {
-          const { data: devData, error: devErr } = await supabase.from('devices').insert({
-            company_id: COMPANY_ID,
-            model: form.device.model || null,
-            imei: form.device.imei || null,
-            is_shared: form.device.is_shared,
-            certification: form.device.certification,
-            icon_type: form.device.icon_type,
-          }).select('id').single();
-          if (devErr) throw devErr;
-          deviceId = devData.id;
+      if (tab === 'anagrafica' && editBuffer.anagrafica) {
+        // Save device
+        let deviceId = op.device_id;
+        if (editBuffer.anagrafica.device.model || editBuffer.anagrafica.device.imei) {
+          if (editBuffer.anagrafica.device.id) {
+            await supabase.from('devices').update({
+              model: editBuffer.anagrafica.device.model || null,
+              imei: editBuffer.anagrafica.device.imei || null,
+              is_shared: editBuffer.anagrafica.device.is_shared,
+              certification: editBuffer.anagrafica.device.certification,
+              icon_type: editBuffer.anagrafica.device.icon_type,
+            }).eq('id', editBuffer.anagrafica.device.id);
+            deviceId = editBuffer.anagrafica.device.id;
+          } else {
+            const { data: dev, error: devErr } = await supabase.from('devices').insert({
+              company_id: COMPANY_ID,
+              model: editBuffer.anagrafica.device.model || null,
+              imei: editBuffer.anagrafica.device.imei || null,
+              is_shared: editBuffer.anagrafica.device.is_shared,
+              certification: editBuffer.anagrafica.device.certification,
+              icon_type: editBuffer.anagrafica.device.icon_type,
+            }).select('id').single();
+            if (devErr) throw devErr;
+            deviceId = dev.id;
+          }
         }
+
+        // Save operator anagrafica
+        const { error } = await supabase.from('operators').update({
+          name: editBuffer.anagrafica.name.trim(),
+          icon_name: editBuffer.anagrafica.icon_name,
+          app_language: editBuffer.anagrafica.app_language,
+          email: editBuffer.anagrafica.email || null,
+          phone_number: editBuffer.anagrafica.phone_number || null,
+          badge_number: editBuffer.anagrafica.badge_number || null,
+          birth_date: editBuffer.anagrafica.birth_date || null,
+          notes: editBuffer.anagrafica.notes || null,
+          device_id: deviceId,
+        }).eq('id', editBuffer.operatorId);
+        if (error) throw error;
+
+        // Update local operators
+        setOperators(prev => prev.map(o => o.id === editBuffer.operatorId ? { ...o, ...editBuffer.anagrafica, devices: editBuffer.anagrafica!.device } : o));
+        setDirtyTabs(prev => ({...prev, anagrafica: false}));
       }
 
-      const operatorPayload = {
-        company_id: COMPANY_ID,
-        name: form.name.trim(),
-        locale: form.app_language,
-        default_preset: form.default_preset,
-        default_session_type: form.default_session_type,
-        default_duration_hours: form.default_duration_hours,
-        allow_preset_change: form.allow_preset_change,
-        login_pin: form.login_pin || null,
-        duress_pin: form.duress_pin || null,
-        device_id: deviceId,
-        birth_date: form.birth_date || null,
-        notes: form.notes || null,
-        icon_name: form.icon_name,
-        app_language: form.app_language,
-        email: form.email || null,
-        phone_number: form.phone_number || null,
-        badge_number: form.badge_number || null,
-      };
-
-      let operatorId = editId;
-
-      if (formMode === 'create') {
-        const { data, error } = await supabase.from('operators').insert(operatorPayload).select('id').single();
+      if (tab === 'turni' && editBuffer.turni) {
+        const { error } = await supabase.from('operators').update({
+          default_preset: editBuffer.turni.default_preset,
+          default_session_type: editBuffer.turni.default_session_type,
+          default_duration_hours: editBuffer.turni.default_duration_hours,
+          allow_preset_change: editBuffer.turni.allow_preset_change,
+          login_pin: editBuffer.turni.login_pin || null,
+          duress_pin: editBuffer.turni.duress_pin || null,
+        }).eq('id', editBuffer.operatorId);
         if (error) throw error;
-        operatorId = data.id;
 
-        // Create operator_status row
-        await supabase.from('operator_status').insert({
-          operator_id: operatorId,
-          state: 'offline',
-          battery_phone: 0,
+        setOperators(prev => prev.map(o => o.id === editBuffer.operatorId ? { ...o, ...editBuffer.turni } : o));
+        setDirtyTabs(prev => ({...prev, turni: false}));
+      }
+
+      if (tab === 'alarms') {
+        const rows: any[] = [];
+        const alarmDefs = [
+          { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: 'true', defVal: '2.5' },
+          { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: 'true', defVal: '90' },
+          { enableKey: 'malore_enabled', valKey: 'malore_angle', def: 'true', defVal: '45' },
+        ];
+
+        const params = paramsByOp[editBuffer.operatorId] || {};
+
+        alarmDefs.forEach(a => {
+          const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
+          if (editBuffer.alarms[a.enableKey] !== undefined && editBuffer.alarms[a.enableKey] !== curEn) {
+            rows.push({
+              operator_id: editBuffer.operatorId,
+              company_id: COMPANY_ID,
+              change_type: 'dashboard',
+              param_name: a.enableKey,
+              old_value: curEn,
+              new_value: editBuffer.alarms[a.enableKey],
+            });
+          }
+
+          const curVal = params[a.valKey] || a.defVal;
+          if (editBuffer.alarms[a.valKey] !== undefined && editBuffer.alarms[a.valKey] !== curVal) {
+            rows.push({
+              operator_id: editBuffer.operatorId,
+              company_id: COMPANY_ID,
+              change_type: 'dashboard',
+              param_name: a.valKey,
+              old_value: curVal,
+              new_value: editBuffer.alarms[a.valKey],
+            });
+          }
         });
-      } else {
-        const { error } = await supabase.from('operators').update(operatorPayload).eq('id', editId);
-        if (error) throw error;
+
+        if (rows.length > 0) {
+          const { error } = await supabase.from('app_config_log').insert(rows);
+          if (error) throw error;
+
+          // Update paramsByOp directly
+          setParamsByOp(prev => {
+            const next = { ...prev };
+            if (!next[editBuffer.operatorId!]) next[editBuffer.operatorId!] = {};
+            rows.forEach(r => {
+              next[editBuffer.operatorId!][r.param_name] = r.new_value;
+            });
+            return next;
+          });
+        }
+
+        // DO NOT reset alarms buffer — keep current values for user to see changes
+        // Buffer will be properly compared against DB in next dirtyTabs check
+        setDirtyTabs(prev => ({...prev, alarms: false}));
       }
 
-      // Emergency contacts: delete existing then re-insert
-      if (operatorId) {
-        await supabase.from('emergency_contacts').delete().eq('operator_id', operatorId);
+      if (tab === 'contacts' && editBuffer.contacts !== undefined) {
+        // Delete all contacts for operator, then re-insert
+        await supabase.from('emergency_contacts').delete().eq('operator_id', editBuffer.operatorId);
 
-        if (form.contacts.length > 0) {
-          const contactRowsFull = form.contacts.map((c, i) => ({
-            operator_id: operatorId,
+        if (editBuffer.contacts.length > 0) {
+          const rows = editBuffer.contacts.map((c, i) => ({
+            operator_id: editBuffer.operatorId,
             position: i + 1,
             name: c.name.trim(),
             phone: c.phone.trim(),
@@ -672,122 +713,116 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
             telegram_chat_id: c.telegram_chat_id,
           })).filter(c => c.name && c.phone);
 
-          if (contactRowsFull.length > 0) {
-            const { error: cErr } = await supabase.from('emergency_contacts').insert(contactRowsFull);
-            if (cErr) throw cErr;
+          if (rows.length > 0) {
+            const { error } = await supabase.from('emergency_contacts').insert(rows);
+            if (error) throw error;
           }
         }
-      }
 
-      // Save cascade settings if in edit mode and tab is contacts
-      if (formMode === 'edit' && editTab === 'contacts' && operatorId) {
-        const op = operators.find(o => o.id === operatorId);
-        if (op) {
+        // Save cascade settings
+        if (editBuffer.cascade) {
           const patch: any = {};
-          if (cascadeEdits.rounds !== undefined && cascadeEdits.rounds !== op.cascade_max_rounds) {
-            patch.cascade_max_rounds = cascadeEdits.rounds;
-          }
-          if (cascadeEdits.timeout !== undefined && cascadeEdits.timeout !== op.cascade_timeout_seconds) {
-            patch.cascade_timeout_seconds = cascadeEdits.timeout;
-          }
-          if (cascadeEdits.delay !== undefined && cascadeEdits.delay !== op.cascade_delay_seconds) {
-            patch.cascade_delay_seconds = cascadeEdits.delay;
-          }
+          if (editBuffer.cascade.rounds !== op.cascade_max_rounds) patch.cascade_max_rounds = editBuffer.cascade.rounds;
+          if (editBuffer.cascade.timeout !== op.cascade_timeout_seconds) patch.cascade_timeout_seconds = editBuffer.cascade.timeout;
+          if (editBuffer.cascade.delay !== op.cascade_delay_seconds) patch.cascade_delay_seconds = editBuffer.cascade.delay;
           if (Object.keys(patch).length > 0) {
-            const { error: cascadeErr } = await supabase.from('operators').update(patch).eq('id', operatorId);
-            if (cascadeErr) throw cascadeErr;
+            const { error } = await supabase.from('operators').update(patch).eq('id', editBuffer.operatorId);
+            if (error) throw error;
           }
-          setCascadeEdits({});
         }
+
+        // Update local operators
+        setOperators(prev => prev.map(o => o.id === editBuffer.operatorId ? { ...o, emergency_contacts: editBuffer.contacts, ...editBuffer.cascade } : o));
+        setDirtyTabs(prev => ({...prev, contacts: false}));
       }
 
-      // Save alarm edits to app_config_log (from any tab)
-      if (formMode === 'edit' && operatorId && Object.keys(alarmEdits).length > 0) {
-        const params = paramsByOp[operatorId] || {};
-        const alarmDefs = [
-          { enableKey: 'fall_enabled', valKey: 'fall_threshold_g', def: '2.5' },
-          { enableKey: 'immobility_enabled', valKey: 'immobility_seconds', def: '90' },
-          { enableKey: 'malore_enabled', valKey: 'malore_angle', def: '45' },
-        ];
-        const logRows: any[] = [];
-        alarmDefs.forEach(a => {
-          const curEn = params[a.enableKey] !== 'false';
-          const newEn = alarmEdits[a.enableKey] ?? curEn;
-          if (newEn !== curEn) {
-            logRows.push({
-              operator_id: operatorId,
-              company_id: COMPANY_ID,
-              change_type: 'dashboard',
-              param_name: a.enableKey,
-              old_value: String(curEn),
-              new_value: String(newEn),
-            });
-          }
-          const curVal = params[a.valKey] || a.def;
-          const newVal = String(alarmEdits[a.valKey] ?? curVal);
-          if (newVal !== curVal) {
-            logRows.push({
-              operator_id: operatorId,
-              company_id: COMPANY_ID,
-              change_type: 'dashboard',
-              param_name: a.valKey,
-              old_value: curVal,
-              new_value: newVal,
-            });
-          }
-        });
-        if (logRows.length > 0) {
-          const { error: logErr } = await supabase.from('app_config_log').insert(logRows);
-          if (logErr) throw logErr;
-        }
-      }
-
-      // Mark as saved (not dirty anymore) + reset edits
-      setIsDirty(false);
-      setAlarmEdits({});
-      setCascadeEdits({});
-      setAlarmBufferByOp(prev => {
-        const next = { ...prev };
-        if (operatorId) delete next[operatorId];
-        return next;
-      });
-
-      await fetchOperators();
+      return true;
     } catch (err: any) {
-      setFormError(err.message || 'Errore durante il salvataggio');
+      setFormError(err.message || `Errore salvataggio ${tab}`);
+      return false;
+    }
+  }
+
+  async function handleSaveAndClose() {
+    setSaving(true);
+    try {
+      const dirtyTabsList = Object.entries(dirtyTabs).filter(([_, isDirty]) => isDirty).map(([tab]) => tab as EditTab);
+
+      for (const tab of dirtyTabsList) {
+        const success = await saveTab(tab);
+        if (!success) {
+          setToast({ message: `❌ Errore salvataggio ${tab}`, type: 'error' });
+          setTimeout(() => setToast(null), 3000);
+          return;
+        }
+      }
+
+      // All saved — close the panel
+      setEditBuffer(emptyEditBuffer());
+      setDirtyTabs({ anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false });
+      setToast({ message: '✅ Tutte le modifiche salvate', type: 'success' });
+      setTimeout(() => setToast(null), 3000);
     } finally {
       setSaving(false);
     }
   }
 
-  async function handleDelete(id: string) {
-    // Delete emergency contacts, operator_status, then operator
-    await supabase.from('emergency_contacts').delete().eq('operator_id', id);
-    await supabase.from('operator_status').delete().eq('operator_id', id);
-    await supabase.from('operators').delete().eq('id', id);
-    setDeleteConfirm(null);
-    fetchOperators();
+  function handleTabChange(nextTab: EditTab) {
+    // Always change tab directly — dialog only appears on close, not on tab change
+    setEditTab(nextTab);
   }
+
+  function closePanel() {
+    if (Object.values(dirtyTabs).some(Boolean)) {
+      setUnsavedDialog({ nextTab: 'anagrafica' });
+    } else {
+      setEditBuffer(emptyEditBuffer());
+      setDirtyTabs({ anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false });
+    }
+  }
+
+  function doClosePanel() {
+    setEditBuffer(emptyEditBuffer());
+    setDirtyTabs({ anagrafica: false, turni: false, alarms: false, contacts: false, status: false, pdf: false });
+    setFormError(null);
+    setUnsavedDialog(null);
+  }
+
+  const filtered = operators.filter(op => op.name.toLowerCase().includes(search.toLowerCase()));
 
   return (
     <>
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 flex-shrink-0"
-              style={{ borderBottom: '1px solid #2A2D3E' }}>
+      <header className="flex items-center justify-between px-6 py-4 flex-shrink-0" style={{ borderBottom: '1px solid #2A2D3E' }}>
         <div>
           <h2 className="text-lg font-bold" style={{ color: '#ECEFF4' }}>Operatori</h2>
-          <p className="text-xs mt-0.5" style={{ color: '#8899AA' }}>
-            {operators.length} operatori registrati
-          </p>
+          <p className="text-xs mt-0.5" style={{ color: '#8899AA' }}>{operators.length} operatori registrati</p>
         </div>
-        <button onClick={openCreate}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-opacity hover:opacity-90"
-                style={{ backgroundColor: '#E63946', color: '#fff' }}>
+        <button
+          onClick={() => {
+            const newOp: OperatorRow = {
+              id: Math.random().toString(36),
+              name: '',
+              default_preset: 'WAREHOUSE',
+              default_session_type: 'turno',
+              default_duration_hours: 8,
+              allow_preset_change: false,
+              login_pin: null,
+              duress_pin: null,
+              locale: 'it',
+              device_id: null,
+              devices: null,
+              emergency_contacts: [],
+            };
+            loadOperatorToBuffer(newOp, 'create');
+          }}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold"
+          style={{ backgroundColor: '#E63946', color: '#fff' }}>
           <Plus size={16} /> Aggiungi Operatore
         </button>
       </header>
 
-      {/* Search bar */}
+      {/* Search */}
       <div className="px-6 py-3 flex-shrink-0" style={{ borderBottom: '1px solid #1A1D27' }}>
         <div className="relative" style={{ maxWidth: '320px' }}>
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: '#8899AA' }} />
@@ -837,111 +872,105 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
                   const presetColor = PRESET_COLORS[op.default_preset] || '#8899AA';
                   const disabledCount = disabledAlarmCount(op.id);
                   return (
-                  <tr key={op.id} className="cursor-pointer hover:bg-white/5"
-                      onClick={() => openEditOnTab(op, 'anagrafica')}
+                    <tr
+                      key={op.id}
+                      className="cursor-pointer hover:bg-white/5"
+                      onClick={() => loadOperatorToBuffer(op, 'edit')}
                       style={{ backgroundColor: idx % 2 === 0 ? '#1A1D27' : '#161922', borderTop: '1px solid #2A2D3E' }}>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <div className="flex-shrink-0">
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
                           <OperatorIcon iconName={op.icon_name || 'shield'} status={sFor.state === 'protected' ? 'PROTETTO' : sFor.state === 'alarm' ? 'ALLARME' : 'STANDBY'} size={28} />
+                          <div>
+                            <div className="font-medium" style={{ color: '#ECEFF4' }}>{op.name}</div>
+                            <span className="text-xs" style={{ color: presetColor }}>{op.default_preset}</span>
+                          </div>
                         </div>
-                        <div>
-                          <div className="font-medium" style={{ color: '#ECEFF4' }}>{op.name}</div>
-                          <span className="text-xs" style={{ color: presetColor }}>{op.default_preset}</span>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div>
-                        <span className="text-xs font-semibold px-2 py-0.5 rounded"
-                              style={{ color: sFor.color, backgroundColor: `${sFor.color}20` }}>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-xs font-semibold px-2 py-0.5 rounded" style={{ color: sFor.color, backgroundColor: `${sFor.color}20` }}>
                           {sFor.label}
                         </span>
-                        {sFor.state === 'protected' && st?.protected_since && (
-                          <div className="text-xs mt-0.5" style={{ color: '#8899AA' }}>
-                            dalle {new Date(st.protected_since).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}
-                          </div>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      {st?.battery_phone != null ? (
-                        <span className="flex items-center gap-1 text-xs font-semibold" style={{ color: batteryColor(st.battery_phone) }}>
-                          <Battery size={12} /> {st.battery_phone}%
-                          {st.charging && <span title="In carica">⚡</span>}
-                        </span>
-                      ) : <span className="text-xs" style={{ color: '#4A5568' }}>—</span>}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className="text-xs font-semibold" style={{ color: heartbeatColor(offMin) }}>
-                        {offMin != null ? `${offMin}m fa` : '—'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <span className="text-xs" style={{ color: '#8899AA' }}>
-                          {op.emergency_contacts?.length || 0}/5
-                        </span>
-                        {(op.emergency_contacts || []).some((c: any) => c.telegram_chat_id) && (
-                          <span title="Telegram configurato" className="text-xs" style={{ color: '#2ECC71' }}>✈</span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      {disabledCount > 0 ? (
-                        <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded"
-                              style={{ color: '#E74C3C', backgroundColor: 'rgba(231,76,60,0.15)' }}>
-                          <AlertTriangle size={10} /> {disabledCount} OFF
-                        </span>
-                      ) : (
-                        <span className="text-xs" style={{ color: '#2ECC71' }}>✓ tutti ON</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
-                      <div className="flex items-center justify-end gap-1">
-                        <button onClick={(e) => { e.stopPropagation(); openEditOnTab(op, 'alarms'); }}
-                                className="p-2 rounded-lg hover:bg-white/5 transition-colors"
-                                style={{ color: '#F39C12' }} title="Allarmi">
-                          <SlidersHorizontal size={16} />
-                        </button>
-                        <button onClick={() => generateOnboardingPdf({
-                                  name: op.name,
-                                  companyName: 'Costruzioni Sicure S.r.l.',
-                                  preset: op.default_preset,
-                                  configToken: (op as any).config_token_permanent || op.id,
-                                  operatorId: op.id,
-                                  contacts: (op.emergency_contacts || []).map((c: any) => ({
-                                    name: c.name, sms: c.sms_enabled !== false,
-                                    telegram: c.telegram_enabled !== false, call: c.call_enabled !== false,
-                                  })),
-                                })}
-                                className="p-2 rounded-lg hover:bg-white/5 transition-colors"
-                                style={{ color: '#3B82F6' }} title="PDF Attivazione">
-                          <FileText size={16} />
-                        </button>
-                        {deleteConfirm === op.id ? (
-                          <div className="flex items-center gap-1">
-                            <button onClick={() => handleDelete(op.id)}
-                                    className="px-2 py-1 rounded text-xs font-medium"
-                                    style={{ backgroundColor: 'rgba(231,76,60,0.2)', color: '#E74C3C' }}>
-                              Conferma
-                            </button>
-                            <button onClick={() => setDeleteConfirm(null)}
-                                    className="px-2 py-1 rounded text-xs"
-                                    style={{ color: '#8899AA' }}>
-                              Annulla
-                            </button>
-                          </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        {st?.battery_phone != null ? (
+                          <span className="flex items-center gap-1 text-xs font-semibold" style={{ color: batteryColor(st.battery_phone) }}>
+                            <Battery size={12} /> {st.battery_phone}%
+                          </span>
                         ) : (
-                          <button onClick={() => setDeleteConfirm(op.id)}
-                                  className="p-2 rounded-lg hover:bg-white/5 transition-colors"
-                                  style={{ color: '#8899AA' }} title="Elimina">
-                            <Trash2 size={16} />
-                          </button>
+                          <span className="text-xs" style={{ color: '#4A5568' }}>—</span>
                         )}
-                      </div>
-                    </td>
-                  </tr>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-xs font-semibold" style={{ color: heartbeatColor(offMin) }}>
+                          {offMin != null ? `${offMin}m fa` : '—'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <span className="text-xs" style={{ color: '#8899AA' }}>{op.emergency_contacts?.length || 0}/5</span>
+                          {(op.emergency_contacts || []).some((c: any) => c.telegram_chat_id) && (
+                            <span title="Telegram" className="text-xs" style={{ color: '#2ECC71' }}>✈</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        {disabledCount > 0 ? (
+                          <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded" style={{ color: '#E74C3C', backgroundColor: 'rgba(231,76,60,0.15)' }}>
+                            <AlertTriangle size={10} /> {disabledCount} OFF
+                          </span>
+                        ) : (
+                          <span className="text-xs" style={{ color: '#2ECC71' }}>✓ tutti ON</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-end gap-1">
+                          <button onClick={() => { loadOperatorToBuffer(op, 'edit'); setEditTab('alarms'); }} className="p-2 rounded-lg hover:bg-white/5" style={{ color: '#F39C12' }}>
+                            <SlidersHorizontal size={16} />
+                          </button>
+                          <button
+                            onClick={() => generateOnboardingPdf({
+                              name: op.name,
+                              companyName: 'Costruzioni Sicure S.r.l.',
+                              preset: op.default_preset,
+                              configToken: op.id,
+                              operatorId: op.id,
+                              contacts: (op.emergency_contacts || []).map((c: any) => ({
+                                name: c.name,
+                                sms: c.sms_enabled !== false,
+                                telegram: c.telegram_enabled !== false,
+                                call: c.call_enabled !== false,
+                              })),
+                            })}
+                            className="p-2 rounded-lg hover:bg-white/5"
+                            style={{ color: '#3B82F6' }}>
+                            <FileText size={16} />
+                          </button>
+                          {deleteConfirm === op.id ? (
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={async () => {
+                                  await supabase.from('emergency_contacts').delete().eq('operator_id', op.id);
+                                  await supabase.from('operator_status').delete().eq('operator_id', op.id);
+                                  await supabase.from('operators').delete().eq('id', op.id);
+                                  setDeleteConfirm(null);
+                                  fetchOperators();
+                                }}
+                                className="px-2 py-1 rounded text-xs font-medium"
+                                style={{ backgroundColor: 'rgba(231,76,60,0.2)', color: '#E74C3C' }}>
+                                Conferma
+                              </button>
+                              <button onClick={() => setDeleteConfirm(null)} className="px-2 py-1 rounded text-xs" style={{ color: '#8899AA' }}>
+                                Annulla
+                              </button>
+                            </div>
+                          ) : (
+                            <button onClick={() => setDeleteConfirm(op.id)} className="p-2 rounded-lg hover:bg-white/5" style={{ color: '#8899AA' }}>
+                              <Trash2 size={16} />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
                   );
                 })}
               </tbody>
@@ -950,593 +979,345 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
         )}
       </div>
 
-      {/* Modal form */}
-      {formMode && (
-        <div className="fixed inset-0 z-50 flex items-start justify-end"
-             style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-             onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
-          <div className="w-full max-w-lg h-full overflow-y-auto"
-               style={{ backgroundColor: '#1A1D27', borderLeft: '1px solid #2A2D3E' }}>
-            {/* Panel header */}
-            <div className="sticky top-0 z-10 flex items-center justify-between px-5 py-4"
-                 style={{ backgroundColor: '#1A1D27', borderBottom: '1px solid #2A2D3E' }}>
+      {/* Edit Panel Modal */}
+      {editBuffer.mode && (
+        <div className="fixed inset-0 z-50 flex items-start justify-end" style={{ backgroundColor: 'rgba(0,0,0,0.6)' }} onClick={e => { if (e.target === e.currentTarget) closePanel(); }}>
+          <div className="w-full max-w-lg h-full overflow-y-auto" style={{ backgroundColor: '#1A1D27', borderLeft: '1px solid #2A2D3E' }}>
+            {/* Panel Header */}
+            <div className="sticky top-0 z-10 flex items-center justify-between px-5 py-4" style={{ backgroundColor: '#1A1D27', borderBottom: '1px solid #2A2D3E' }}>
               <h3 className="text-base font-bold" style={{ color: '#ECEFF4' }}>
-                {formMode === 'create' ? 'Nuovo Operatore' : form.name || 'Modifica Operatore'}
+                {editBuffer.mode === 'create' ? 'Nuovo Operatore' : editBuffer.anagrafica?.name || 'Modifica Operatore'}
               </h3>
-              <button onClick={handleClose} className="p-1.5 rounded-lg hover:bg-white/5"
-                      style={{ color: '#8899AA' }}>
+              <button onClick={closePanel} className="p-1.5 rounded-lg hover:bg-white/5" style={{ color: '#8899AA' }}>
                 <X size={20} />
               </button>
             </div>
 
-            {/* Tab navigation (only for edit mode — create starts on anagrafica) */}
-            {formMode === 'edit' && (
+            {/* Tabs */}
+            {editBuffer.mode === 'edit' && (
               <div className="flex gap-1 px-5 pt-3 overflow-x-auto" style={{ borderBottom: '1px solid #2A2D3E' }}>
-                {([
-                  { id: 'anagrafica', label: '👤 Anagrafica' },
-                  { id: 'turni', label: '⚙️ Turni & Preset' },
-                  { id: 'alarms', label: '🚨 Allarmi' },
-                  { id: 'contacts', label: '📞 Contatti' },
-                  { id: 'status', label: '📊 Stato' },
-                  { id: 'pdf', label: '📄 PDF' },
-                ] as const).map(tab => (
-                  <button key={tab.id} onClick={() => handleTabChange(tab.id)}
-                    className="px-3 py-2 text-xs font-semibold whitespace-nowrap"
+                {(['anagrafica', 'turni', 'alarms', 'contacts', 'status', 'pdf'] as EditTab[]).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => handleTabChange(tab)}
+                    className="px-3 py-2.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap"
                     style={{
-                      color: editTab === tab.id ? '#ECEFF4' : '#8899AA',
-                      borderBottom: editTab === tab.id ? '2px solid #E63946' : '2px solid transparent',
-                      marginBottom: -1,
+                      backgroundColor: editTab === tab ? '#E63946' : 'transparent',
+                      color: editTab === tab ? '#fff' : '#8899AA',
+                      borderBottom: dirtyTabs[tab] ? '2px solid #F39C12' : 'none',
                     }}>
-                    {tab.label}
+                    {tab === 'anagrafica' && '📋 Anagrafica'}
+                    {tab === 'turni' && '⏱️ Turni'}
+                    {tab === 'alarms' && '🚨 Allarmi'}
+                    {tab === 'contacts' && '📞 Contatti'}
+                    {tab === 'status' && '📊 Stato'}
+                    {tab === 'pdf' && '📄 PDF'}
                   </button>
                 ))}
               </div>
             )}
 
-            <div className="px-5 py-4 space-y-1">
-              {/* Error */}
-              {formError && (
-                <div className="flex items-center gap-2 px-3 py-2 rounded-lg mb-3"
-                     style={{ backgroundColor: 'rgba(231,76,60,0.1)', border: '1px solid rgba(231,76,60,0.25)' }}>
-                  <AlertCircle size={14} className="text-red-400" />
-                  <span className="text-xs text-red-300">{formError}</span>
+            {/* Content */}
+            <div className="p-5 space-y-4">
+              {/* ANAGRAFICA TAB */}
+              {(editBuffer.mode === 'create' || editTab === 'anagrafica') && editBuffer.anagrafica && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<Shield size={16} />} title="Anagrafica" />
+                  <Input label="Nome" value={editBuffer.anagrafica.name} onChange={e => updateAnagrafica({ name: e.target.value })} />
+                  <Input label="Email" value={editBuffer.anagrafica.email} onChange={e => updateAnagrafica({ email: e.target.value })} />
+                  <Input label="Telefono" value={editBuffer.anagrafica.phone_number} onChange={e => updateAnagrafica({ phone_number: e.target.value })} />
+                  <Input label="Badge Number" value={editBuffer.anagrafica.badge_number} onChange={e => updateAnagrafica({ badge_number: e.target.value })} />
+                  <Input label="Data Nascita" type="date" value={editBuffer.anagrafica.birth_date} onChange={e => updateAnagrafica({ birth_date: e.target.value })} />
+                  <Input label="Note" value={editBuffer.anagrafica.notes} onChange={e => updateAnagrafica({ notes: e.target.value })} />
+                  <SectionTitle icon={<Smartphone size={16} />} title="Dispositivo" />
+                  {editBuffer.anagrafica?.device && (
+                    <>
+                      <Input label="Modello" value={editBuffer.anagrafica.device.model} onChange={e => updateAnagrafica({ device: { ...editBuffer.anagrafica!.device, model: e.target.value } })} />
+                      <Input label="IMEI" value={editBuffer.anagrafica.device.imei} onChange={e => updateAnagrafica({ device: { ...editBuffer.anagrafica!.device, imei: e.target.value } })} />
+                    </>
+                  )}
                 </div>
               )}
 
-              {(formMode === 'create' || editTab === 'anagrafica') && (<>
-              {/* --- Dati personali --- */}
-              <SectionTitle icon={<Users size={16} />} title="Dati personali" />
-              <div className="grid grid-cols-2 gap-3">
-                <div className="col-span-2">
-                  <Input label="Nome completo *" value={form.name}
-                         onChange={e => updateForm({ name: e.target.value })} placeholder="Mario Rossi" />
+              {/* TURNI TAB */}
+              {editTab === 'turni' && editBuffer.turni && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<Clock size={16} />} title="Turni" />
+                  <Select label="Preset" options={PRESETS.map(p => ({ value: p, label: p }))} value={editBuffer.turni.default_preset} onChange={e => updateTurni({ default_preset: e.target.value })} />
+                  <Select label="Tipo Sessione" options={SESSION_TYPES} value={editBuffer.turni.default_session_type} onChange={e => updateTurni({ default_session_type: e.target.value })} />
+                  <Input label="Durata (ore)" type="number" value={editBuffer.turni.default_duration_hours} onChange={e => updateTurni({ default_duration_hours: parseInt(e.target.value) || 8 })} />
+                  <Checkbox label="Permetti cambio preset" checked={editBuffer.turni.allow_preset_change} onChange={v => updateTurni({ allow_preset_change: v })} />
+                  <Input label="PIN Accesso" value={editBuffer.turni.login_pin} onChange={e => updateTurni({ login_pin: e.target.value })} />
+                  <Input label="PIN Duress" value={editBuffer.turni.duress_pin} onChange={e => updateTurni({ duress_pin: e.target.value })} />
                 </div>
-                <div>
-                  <label className="block text-xs font-medium mb-1" style={{ color: '#8899AA' }}>Data di nascita</label>
-                  <input type="date" value={form.birth_date}
-                    onChange={e => updateForm({ birth_date: e.target.value })}
-                    className="w-full px-3 py-2 rounded-lg text-sm outline-none"
-                    style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E', color: '#ECEFF4' }} />
-                </div>
-                <Input label="Email" type="email" value={form.email}
-                       onChange={e => updateForm({ email: e.target.value })} placeholder="mario.rossi@azienda.it" />
-                <Input label="Telefono" value={form.phone_number}
-                       onChange={e => updateForm({ phone_number: e.target.value })} placeholder="+39 333 1234567" />
-                <Input label="Matricola / Badge" value={form.badge_number}
-                       onChange={e => updateForm({ badge_number: e.target.value })} placeholder="MAT-001" />
-                <div className="col-span-2">
-                  <label className="block text-xs font-medium mb-1" style={{ color: '#8899AA' }}>
-                    Note <span style={{ color: '#4A5568' }}>(max 500 caratteri)</span>
-                  </label>
-                  <textarea value={form.notes} maxLength={500} rows={3}
-                    onChange={e => updateForm({ notes: e.target.value })}
-                    placeholder="Note libere sull'operatore..."
-                    className="w-full px-3 py-2 rounded-lg text-sm outline-none resize-none"
-                    style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E', color: '#ECEFF4' }} />
-                  <div className="text-right text-xs mt-0.5" style={{ color: '#4A5568' }}>{form.notes.length}/500</div>
-                </div>
-              </div>
+              )}
 
-              {/* --- Aspetto --- */}
-              <SectionTitle icon={<Shield size={16} />} title="Aspetto" />
-              <div>
-                <label className="block text-xs font-medium mb-1.5" style={{ color: '#8899AA' }}>Icona operatore</label>
-                <div className="relative">
-                  <button type="button"
-                    onClick={() => setIconDropdownOpen(o => !o)}
-                    className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm"
-                    style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E', color: '#ECEFF4' }}>
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="#E63946">
-                      <path d={ICON_PATHS[form.icon_name] || ICON_PATHS.shield} />
-                    </svg>
-                    <span>{DEVICE_ICONS.find(i => i.key === form.icon_name)?.label || 'Scudo'}</span>
-                    <ChevronDown size={14} style={{ color: '#8899AA', marginLeft: 'auto' }} />
-                  </button>
-                  {iconDropdownOpen && (
-                    <div className="absolute top-full left-0 right-0 mt-1 z-20 rounded-lg overflow-hidden"
-                         style={{ backgroundColor: '#1A1D27', border: '1px solid #2A2D3E', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
-                      {DEVICE_ICONS.map(ic => (
-                        <button key={ic.key} type="button"
-                          onClick={() => { updateForm({ icon_name: ic.key }); setIconDropdownOpen(false); }}
-                          className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-white/5 transition-colors"
-                          style={{
-                            color: form.icon_name === ic.key ? '#ECEFF4' : '#8899AA',
-                            backgroundColor: form.icon_name === ic.key ? 'rgba(230,57,70,0.1)' : 'transparent',
-                          }}>
-                          <svg width="18" height="18" viewBox="0 0 24 24" fill={form.icon_name === ic.key ? '#E63946' : '#6B7280'}>
-                            <path d={ICON_PATHS[ic.key]} />
-                          </svg>
-                          <span className="text-sm">{ic.label}</span>
-                          {form.icon_name === ic.key && <span className="ml-auto text-xs" style={{ color: '#E63946' }}>✓</span>}
+              {/* ALARMS TAB */}
+              {editTab === 'alarms' && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<AlertTriangle size={16} />} title="Allarmi" />
+                  {(['fall_enabled', 'immobility_enabled', 'malore_enabled'] as const).map((key, idx) => {
+                    const enabled = editBuffer.alarms[key] !== 'false';
+                    const names = ['🔴 Caduta', '🟠 Immobilità', '🟡 Malore'];
+                    const valKeys = ['fall_threshold_g', 'immobility_seconds', 'malore_angle'];
+                    const units = ['g', 's', '°'];
+                    const defaults = ['2.5', '90', '45'];
+                    return (
+                      <div key={key} style={{ backgroundColor: enabled ? 'rgba(46,204,113,0.08)' : 'rgba(231,76,60,0.08)', border: `1px solid ${enabled ? 'rgba(46,204,113,0.3)' : 'rgba(231,76,60,0.3)'}`, borderRadius: '8px', padding: '12px' }}>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-bold" style={{ color: '#ECEFF4' }}>{names[idx]}</span>
+                          <button
+                            onClick={() => updateAlarms(key, enabled ? 'false' : 'true')}
+                            className="relative inline-flex items-center h-6 w-11 rounded-full"
+                            style={{ backgroundColor: enabled ? '#2ECC71' : '#E74C3C' }}>
+                            <span className="inline-block w-4 h-4 rounded-full bg-white" style={{ transform: enabled ? 'translateX(24px)' : 'translateX(2px)', transition: 'transform 0.15s' }} />
+                          </button>
+                        </div>
+                        {enabled && (
+                          <Input
+                            label={`${['Soglia G', 'Tempo', 'Angolazione'][idx]} (${units[idx]})`}
+                            type="number"
+                            value={Number(editBuffer.alarms[valKeys[idx]] || defaults[idx])}
+                            onChange={e => updateAlarms(valKeys[idx], String(Number(e.target.value || defaults[idx])))}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* CONTACTS TAB */}
+              {editTab === 'contacts' && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<Phone size={16} />} title="Contatti" />
+                  {editBuffer.contacts.map((contact, idx) => (
+                    <div key={idx} style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E', borderRadius: '8px', padding: '12px' }}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-semibold" style={{ color: '#8899AA' }}>Contatto {idx + 1}</span>
+                        <button onClick={() => removeContact(idx)} className="p-1" style={{ color: '#E74C3C' }}>
+                          <Trash2 size={14} />
                         </button>
-                      ))}
+                      </div>
+                      <Input label="Nome" value={contact.name} onChange={e => updateContact(idx, { name: e.target.value })} />
+                      <Input label="Telefono" value={contact.phone} onChange={e => updateContact(idx, { phone: e.target.value })} />
+                      <Select
+                        label="Relazione"
+                        options={[
+                          { value: 'manager', label: 'Manager' },
+                          { value: 'rspp', label: 'RSPP' },
+                          { value: 'familiare', label: 'Familiare' },
+                          { value: 'collega', label: 'Collega' },
+                        ]}
+                        value={contact.relation}
+                        onChange={e => updateContact(idx, { relation: e.target.value })}
+                      />
+                      <div className="flex gap-3 mt-2">
+                        <Checkbox label="📱 SMS" checked={contact.sms_enabled} onChange={v => updateContact(idx, { sms_enabled: v })} />
+                        <Checkbox label="✈️ Telegram" checked={contact.telegram_enabled} onChange={v => updateContact(idx, { telegram_enabled: v })} />
+                        <Checkbox label="📞 Chiamata" checked={contact.call_enabled} onChange={v => updateContact(idx, { call_enabled: v })} />
+                      </div>
+                    </div>
+                  ))}
+                  {editBuffer.contacts.length < 5 && (
+                    <button
+                      onClick={addContact}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium"
+                      style={{ border: '1px dashed #2A2D3E', color: '#8899AA' }}>
+                      <Plus size={14} /> Aggiungi contatto
+                    </button>
+                  )}
+                  <SectionTitle icon={<SlidersHorizontal size={16} />} title="Cascata Chiamate" />
+                  {editBuffer.cascade && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <span className="text-xs" style={{ color: '#ECEFF4' }}>Round</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="5"
+                          value={editBuffer.cascade.rounds}
+                          onChange={e => updateCascade({ rounds: parseInt(e.target.value) || 2 })}
+                          className="w-20 px-2 py-1 text-xs rounded text-right"
+                          style={{ backgroundColor: '#1A1D27', color: '#ECEFF4', border: '1px solid #2A2D3E' }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <span className="text-xs" style={{ color: '#ECEFF4' }}>Timeout (sec)</span>
+                        <input
+                          type="number"
+                          min="10"
+                          max="60"
+                          value={editBuffer.cascade.timeout}
+                          onChange={e => updateCascade({ timeout: parseInt(e.target.value) || 25 })}
+                          className="w-20 px-2 py-1 text-xs rounded text-right"
+                          style={{ backgroundColor: '#1A1D27', color: '#ECEFF4', border: '1px solid #2A2D3E' }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <span className="text-xs" style={{ color: '#ECEFF4' }}>Delay (sec)</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max="30"
+                          value={editBuffer.cascade.delay}
+                          onChange={e => updateCascade({ delay: parseInt(e.target.value) || 10 })}
+                          className="w-20 px-2 py-1 text-xs rounded text-right"
+                          style={{ backgroundColor: '#1A1D27', color: '#ECEFF4', border: '1px solid #2A2D3E' }}
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
-              </div>
-
-              {/* --- Documenti (futuro) --- */}
-              <SectionTitle icon={<FileText size={16} />} title="Documenti" />
-              <div className="rounded-lg px-4 py-3 flex items-center gap-3"
-                   style={{ backgroundColor: '#0F1117', border: '1px dashed #2A2D3E' }}>
-                <span style={{ color: '#4A5568', fontSize: 20 }}>📎</span>
-                <span className="text-xs" style={{ color: '#4A5568' }}>
-                  Allegati documenti — funzionalità in arrivo
-                </span>
-              </div>
-              </>)}
-
-              {/* TAB: TURNI & PRESET */}
-              {(formMode === 'edit' && editTab === 'turni') && (<>
-              {/* --- Preset ambientale --- */}
-              <SectionTitle icon={<SlidersHorizontal size={16} />} title="Preset ambientale" />
-              {(() => {
-                const PRESET_DESC: Record<string, string> = {
-                  OFFICE: 'Uffici, bassa attività fisica, soglie conservative',
-                  WAREHOUSE: 'Magazzini e logistica — preset default',
-                  CONSTRUCTION: 'Cantieri edili, soglie caduta aumentate',
-                  INDUSTRY: 'Industria pesante, ambienti ad alto rischio',
-                  VEHICLE: 'Guida veicoli — fall detection disabilitata',
-                  ALTITUDE: 'Lavori in quota, minima singola fonte 10s',
-                };
-                return (
-                  <div className="space-y-2">
-                    {PRESETS.map(p => (
-                      <button key={p} type="button"
-                        onClick={() => updateForm({ default_preset: p })}
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-left"
-                        style={{
-                          backgroundColor: form.default_preset === p ? `${PRESET_COLORS[p]}15` : '#0F1117',
-                          border: `1px solid ${form.default_preset === p ? PRESET_COLORS[p] : '#2A2D3E'}`,
-                        }}>
-                        <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: PRESET_COLORS[p] }} />
-                        <div>
-                          <div className="text-xs font-bold" style={{ color: form.default_preset === p ? '#ECEFF4' : '#8899AA' }}>{p}</div>
-                          <div className="text-xs" style={{ color: '#4A5568' }}>{PRESET_DESC[p]}</div>
-                        </div>
-                        {form.default_preset === p && <span className="ml-auto text-xs" style={{ color: PRESET_COLORS[p] }}>✓</span>}
-                      </button>
-                    ))}
-                    <div className="flex items-center gap-2 mt-2 pt-2" style={{ borderTop: '1px solid #2A2D3E' }}>
-                      <Checkbox label="Permetti all'operatore di cambiare preset" checked={form.allow_preset_change}
-                                onChange={v => updateForm({ allow_preset_change: v })} />
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* --- Sessione di lavoro --- */}
-              <SectionTitle icon={<Clock size={16} />} title="Sessione di lavoro" />
-              <div className="grid grid-cols-2 gap-3">
-                <Select label="Tipo sessione default" value={form.default_session_type}
-                        onChange={e => updateForm({ default_session_type: e.target.value })}
-                        options={SESSION_TYPES} />
-                <Select label="Durata turno default" value={String(form.default_duration_hours)}
-                        onChange={e => updateForm({ default_duration_hours: parseInt(e.target.value) || 8 })}
-                        options={[
-                          { value: '1', label: '1 ora' },
-                          { value: '4', label: '4 ore' },
-                          { value: '8', label: '8 ore' },
-                          { value: '12', label: '12 ore' },
-                        ]} />
-              </div>
-
-              {/* --- Lingua app --- */}
-              <SectionTitle icon={<Users size={16} />} title="Localizzazione" />
-              <div className="grid grid-cols-2 gap-3">
-                <Select label="Lingua app" value={form.app_language}
-                        onChange={e => updateForm({ app_language: e.target.value })}
-                        options={[{ value: 'it', label: 'Italiano' }, { value: 'en', label: 'English' }]} />
-              </div>
-              </>)}
-
-              {(formMode === 'create' || editTab === 'contacts') && (<>
-              {/* Section 5: Emergency contacts */}
-              <SectionTitle icon={<Phone size={16} />} title={`Contatti emergenza (${form.contacts.length}/5)`} />
-
-              {/* Telegram invite link */}
-              {editId && (
-                <div className="rounded-lg p-3 mb-3" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="text-xs font-medium" style={{ color: '#3B82F6' }}>Link invito Telegram</p>
-                      <p className="text-xs font-mono mt-1" style={{ color: '#8899AA' }}>
-                        t.me/SoloSafe_bot?start=OP-{editId.substring(0, 8)}
-                      </p>
-                    </div>
-                    <div className="flex gap-2">
-                      <button onClick={() => {
-                        navigator.clipboard.writeText(`https://t.me/SoloSafe_bot?start=OP-${editId.substring(0, 8)}`);
-                      }} className="px-2 py-1 rounded text-xs" style={{ backgroundColor: '#2A2D3E', color: '#ECEFF4' }}>
-                        📋 Copia
-                      </button>
-                      <a href={`sms:?body=Ricevi gli allarmi SoloSafe: https://t.me/SoloSafe_bot?start=OP-${editId.substring(0, 8)}`}
-                         className="px-2 py-1 rounded text-xs" style={{ backgroundColor: '#2A2D3E', color: '#ECEFF4' }}>
-                        📱 SMS
-                      </a>
-                    </div>
-                  </div>
-                </div>
               )}
 
-              {form.contacts.map((contact, idx) => (
-                <div key={idx} className="rounded-lg p-3 mb-2"
-                     style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium" style={{ color: '#E63946' }}>
-                        Contatto #{contact.position}
-                      </span>
-                      {contact.telegram_chat_id ? (
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: '#2ECC71', backgroundColor: 'rgba(46,204,113,0.1)' }}>✅ Telegram</span>
-                      ) : contact.telegram_enabled ? (
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: '#F39C12', backgroundColor: 'rgba(243,156,18,0.1)' }}>⏳ In attesa</span>
-                      ) : (
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: '#4A5568', backgroundColor: 'rgba(74,85,104,0.1)' }}>➖ No Telegram</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <button onClick={() => {
-                        if (idx === 0) return;
-                        setForm(prev => {
-                          const arr = [...prev.contacts];
-                          [arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]];
-                          return { ...prev, contacts: arr.map((c, i) => ({ ...c, position: i + 1 })) };
-                        });
-                      }} disabled={idx === 0}
-                        className="p-1 rounded hover:bg-white/5 disabled:opacity-30"
-                        style={{ color: '#8899AA' }} title="Sposta su">↑</button>
-                      <button onClick={() => {
-                        if (idx === form.contacts.length - 1) return;
-                        setForm(prev => {
-                          const arr = [...prev.contacts];
-                          [arr[idx + 1], arr[idx]] = [arr[idx], arr[idx + 1]];
-                          return { ...prev, contacts: arr.map((c, i) => ({ ...c, position: i + 1 })) };
-                        });
-                      }} disabled={idx === form.contacts.length - 1}
-                        className="p-1 rounded hover:bg-white/5 disabled:opacity-30"
-                        style={{ color: '#8899AA' }} title="Sposta giù">↓</button>
-                      <button onClick={() => removeContact(idx)}
-                              className="p-1 rounded hover:bg-white/5" style={{ color: '#8899AA' }}>
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Input label="Nome" value={contact.name}
-                           onChange={e => updateContact(idx, { name: e.target.value })} placeholder="Nome contatto" />
-                    <Input label="Telefono" value={contact.phone}
-                           onChange={e => updateContact(idx, { phone: e.target.value })} placeholder="+39 333 1234567" />
-                    <Select label="Relazione" value={contact.relation}
-                            onChange={e => updateContact(idx, { relation: e.target.value })}
-                            options={[{value:'manager',label:'Manager'},{value:'rspp',label:'RSPP'},{value:'familiare',label:'Familiare'},{value:'collega',label:'Collega'}]} />
-                    <Input label="Telegram Chat ID" value={contact.telegram_chat_id?.toString() || ''}
-                           onChange={e => updateContact(idx, { telegram_chat_id: e.target.value ? parseInt(e.target.value) || null : null })}
-                           placeholder="Invia /start a @SoloSafeBot" />
-                  </div>
-                  <div className="flex items-center gap-4 mt-2">
-                    <Checkbox label="📱 SMS" checked={contact.sms_enabled} onChange={v => updateContact(idx, { sms_enabled: v })} />
-                    <Checkbox label="✈️ Telegram" checked={contact.telegram_enabled} onChange={v => updateContact(idx, { telegram_enabled: v })} />
-                    <Checkbox label="📞 Chiamata" checked={contact.call_enabled} onChange={v => updateContact(idx, { call_enabled: v })} />
-                    <Checkbox label="DTMF" checked={contact.dtmf_required} onChange={v => updateContact(idx, { dtmf_required: v })} />
-                  </div>
-                </div>
-              ))}
-
-              {form.contacts.length < 5 && (
-                <button onClick={addContact}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium w-full justify-center"
-                        style={{ border: '1px dashed #2A2D3E', color: '#8899AA' }}>
-                  <Plus size={14} /> Aggiungi contatto
-                </button>
-              )}
-
-              {/* Cascade settings inside contacts tab */}
-              {formMode === 'edit' && editId && (() => {
-                const op = operators.find(o => o.id === editId);
-                if (!op) return null;
-                const rounds = cascadeEdits.rounds ?? op.cascade_max_rounds ?? 2;
-                const timeout = cascadeEdits.timeout ?? op.cascade_timeout_seconds ?? 25;
-                const dly = cascadeEdits.delay ?? op.cascade_delay_seconds ?? 10;
-                const onSave = async () => {
-                  const patch: any = {};
-                  if (rounds !== op.cascade_max_rounds) patch.cascade_max_rounds = rounds;
-                  if (timeout !== op.cascade_timeout_seconds) patch.cascade_timeout_seconds = timeout;
-                  if (dly !== op.cascade_delay_seconds) patch.cascade_delay_seconds = dly;
-                  if (Object.keys(patch).length === 0) return;
-                  await supabase.from('operators').update(patch).eq('id', op.id);
-                  setCascadeEdits({});
-                  fetchOperators();
-                };
-                return (
-                  <>
-                    <SectionTitle icon={<Phone size={16} />} title="Impostazioni cascata chiamate" />
-                    <div className="space-y-2">
-                      {[
-                        { k: 'rounds', label: 'Round', val: rounds, min: 1, max: 5, suffix: 'cicli', set: (v: number) => setCascadeEdits(c => ({ ...c, rounds: v })) },
-                        { k: 'timeout', label: 'Timeout per contatto', val: timeout, min: 10, max: 60, suffix: 'sec', set: (v: number) => setCascadeEdits(c => ({ ...c, timeout: v })) },
-                        { k: 'delay', label: 'Ritardo prima chiamata', val: dly, min: 0, max: 30, suffix: 'sec', set: (v: number) => setCascadeEdits(c => ({ ...c, delay: v })) },
-                      ].map(f => (
-                        <div key={f.k} className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <span className="text-xs" style={{ color: '#ECEFF4' }}>{f.label}</span>
-                          <div className="flex items-center gap-2">
-                            <input type="number" value={f.val} min={f.min} max={f.max}
-                              onChange={e => f.set(parseInt(e.target.value) || f.val)}
-                              className="w-20 px-2 py-1 text-xs rounded text-right"
-                              style={{ backgroundColor: '#1A1D27', color: '#ECEFF4', border: '1px solid #2A2D3E' }} />
-                            <span className="text-xs" style={{ color: '#8899AA' }}>{f.suffix}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                );
-              })()}
-              </>)}
-
-              {/* TAB: ALARMS */}
-              {formMode === 'edit' && editTab === 'alarms' && editId && (() => {
-                const params = paramsByOp[editId] || {};
-                const buffer = alarmBufferByOp[editId] || {};
-                const alarmDefs = [
-                  { name: '🔴 Caduta', enableKey: 'fall_enabled', valKey: 'fall_threshold_g', unit: 'g', def: 'true', defVal: '2.5', label: 'Soglia G', min: 1.5, max: 4, step: 0.1 },
-                  { name: '🟠 Immobilità', enableKey: 'immobility_enabled', valKey: 'immobility_seconds', unit: 's', def: 'true', defVal: '90', label: 'Tempo', min: 30, max: 300, step: 10 },
-                  { name: '🟡 Malore', enableKey: 'malore_enabled', valKey: 'malore_angle', unit: '°', def: 'true', defVal: '45', label: 'Angolazione', min: 20, max: 90, step: 5 },
-                ];
-
-                const handleToggle = (enableKey: string, newValue: boolean) => {
-                  const strVal = String(newValue);
-                  setAlarmBufferByOp(prev => ({ ...prev, [editId]: { ...buffer, [enableKey]: strVal } }));
-                  setAlarmEdits(e => ({ ...e, [enableKey]: newValue }));
-                };
-
-                const handleThresholdChange = (valKey: string, newValue: string) => {
-                  setAlarmBufferByOp(prev => ({ ...prev, [editId]: { ...buffer, [valKey]: newValue } }));
-                  setAlarmEdits(e => ({ ...e, [valKey]: newValue }));
-                };
-
-                // Check if there are modifications
-                let hasChanges = false;
-                alarmDefs.forEach(a => {
-                  const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
-                  const bufEn = buffer[a.enableKey] ?? curEn;
-                  if (bufEn !== curEn) hasChanges = true;
-
-                  const curVal = params[a.valKey] || a.defVal;
-                  const bufVal = buffer[a.valKey] ?? curVal;
-                  if (bufVal !== curVal) hasChanges = true;
-                });
-
-                return (
-                  <div className="space-y-3 mt-2">
-                    {alarmDefs.map(a => {
-                      const curEn = params[a.enableKey] !== 'false' ? 'true' : 'false';
-                      const en = (buffer[a.enableKey] ?? curEn) === 'true';
-                      const curVal = params[a.valKey] || a.defVal;
-                      const val = buffer[a.valKey] ?? curVal;
-                      return (
-                        <div key={a.name} className="flex items-center justify-between p-3 rounded-xl"
-                             style={{ backgroundColor: en ? 'rgba(46,204,113,0.08)' : 'rgba(231,76,60,0.08)', border: `1px solid ${en ? 'rgba(46,204,113,0.3)' : 'rgba(231,76,60,0.3)'}` }}>
-                          <div className="flex items-center gap-3">
-                            <span className="text-sm font-bold" style={{ color: '#ECEFF4', minWidth: 110 }}>{a.name}</span>
-                            <button onClick={() => handleToggle(a.enableKey, !en)}
-                              className="relative inline-flex items-center h-6 w-11 rounded-full"
-                              style={{ backgroundColor: en ? '#2ECC71' : '#E74C3C' }}>
-                              <span className="inline-block w-4 h-4 rounded-full bg-white"
-                                    style={{ transform: en ? 'translateX(24px)' : 'translateX(2px)', transition: 'transform 0.15s' }} />
-                            </button>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <span className="text-xs" style={{ color: '#8899AA' }}>{a.label}:</span>
-                            <input type="number" value={val} min={a.min} max={a.max} step={a.step} disabled={!en}
-                              onChange={e => handleThresholdChange(a.valKey, e.target.value)}
-                              className="w-20 px-2 py-1 text-xs rounded text-right font-semibold"
-                              style={{ backgroundColor: '#0F1117', color: '#ECEFF4', border: '1px solid #2A2D3E', opacity: en ? 1 : 0.5 }} />
-                            <span className="text-xs" style={{ color: '#8899AA' }}>{a.unit}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                    <div className="flex items-center justify-between p-3 rounded-xl" style={{ backgroundColor: 'rgba(46,204,113,0.08)', border: '1px solid rgba(46,204,113,0.3)' }}>
-                      <span className="text-sm font-bold" style={{ color: '#ECEFF4' }}>🆘 SOS</span>
-                      <span className="text-xs font-bold px-2 py-0.5 rounded" style={{ backgroundColor: '#2ECC71', color: '#fff' }}>SEMPRE ON</span>
-                    </div>
-                    <button onClick={() => saveAlarmSettings(editId)} disabled={!hasChanges || savingAlarms}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold text-white"
-                      style={{ backgroundColor: hasChanges ? '#E63946' : '#4A5568', opacity: hasChanges ? 1 : 0.5, cursor: hasChanges ? 'pointer' : 'not-allowed' }}>
-                      {savingAlarms ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                      Salva modifiche allarmi
-                    </button>
-                  </div>
-                );
-              })()}
-
-              {/* TAB: STATUS */}
-              {formMode === 'edit' && editTab === 'status' && editId && (() => {
-                const st = statusByOp[editId];
-                const op = operators.find(o => o.id === editId);
-                const sFor = statusFor(editId);
-                return (
-                  <div className="space-y-3 mt-2">
-                    {st ? (
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><Activity size={10} /> STATO</div>
-                          <div className="text-base font-bold" style={{ color: sFor.color }}>{sFor.label}</div>
-                        </div>
-                        <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><Battery size={10} /> BATTERIA</div>
-                          <div className="text-base font-bold" style={{ color: batteryColor(st.battery_phone) }}>
-                            {st.battery_phone ?? '—'}%
-                          </div>
-                        </div>
-                        <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><Clock size={10} /> ULTIMO HEARTBEAT</div>
-                          <div className="text-xs" style={{ color: '#ECEFF4' }}>{new Date(st.created_at).toLocaleString('it-IT')}</div>
-                          <div className="text-xs mt-1" style={{ color: '#8899AA' }}>{offlineMin(st.created_at)} min fa</div>
-                        </div>
-                        <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <div className="flex items-center gap-1 text-xs mb-1" style={{ color: '#8899AA' }}><MapPin size={10} /> POSIZIONE GPS</div>
-                          {st.lat ? (
-                            <div>
-                              <a href={`https://maps.google.com/?q=${st.lat},${st.lng}`} target="_blank" rel="noreferrer"
-                                 className="text-xs underline block" style={{ color: '#3B82F6' }}>
-                                {st.lat.toFixed(5)}, {st.lng.toFixed(5)}
-                              </a>
-                              <div className="text-xs mt-1" style={{ color: '#ECEFF4' }}>
-                                {addressByOp[editId] || '⟳ In caricamento...'}
-                              </div>
-                            </div>
-                          ) : <span className="text-xs" style={{ color: '#8899AA' }}>—</span>}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="p-6 text-center rounded-xl" style={{ backgroundColor: '#0F1117' }}>
-                        <p className="text-xs" style={{ color: '#8899AA' }}>Nessun dato disponibile</p>
-                      </div>
-                    )}
-                    {/* Dispositivo */}
-                    <SectionTitle icon={<Smartphone size={16} />} title="Dispositivo" />
+              {/* STATUS TAB */}
+              {editTab === 'status' && editBuffer.operatorId && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<Activity size={16} />} title="Stato Operatore" />
+                  {statusByOp[editBuffer.operatorId] ? (
                     <div className="grid grid-cols-2 gap-3">
-                      {[
-                        { label: 'Modello', value: op?.devices?.model || '—' },
-                        { label: 'IMEI', value: op?.devices?.imei || '—' },
-                      ].map(row => (
-                        <div key={row.label} className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                          <div className="text-xs mb-1" style={{ color: '#8899AA' }}>{row.label.toUpperCase()}</div>
-                          <div className="text-xs font-semibold" style={{ color: '#ECEFF4' }}>{row.value}</div>
+                      <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <div className="text-xs mb-1" style={{ color: '#8899AA' }}>STATO</div>
+                        <div className="text-base font-bold" style={{ color: statusFor(editBuffer.operatorId).color }}>{statusFor(editBuffer.operatorId).label}</div>
+                      </div>
+                      <div className="p-3 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <div className="text-xs mb-1" style={{ color: '#8899AA' }}>BATTERIA</div>
+                        <div className="text-base font-bold" style={{ color: batteryColor(statusByOp[editBuffer.operatorId]?.battery_phone) }}>
+                          {statusByOp[editBuffer.operatorId]?.battery_phone ?? '—'}%
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* TAB: PDF */}
-              {formMode === 'edit' && editTab === 'pdf' && editId && (() => {
-                const op = operators.find(o => o.id === editId);
-                if (!op) return null;
-                return (
-                  <div className="space-y-4 mt-2">
-                    <div className="p-4 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                      <h4 className="text-sm font-bold mb-2" style={{ color: '#ECEFF4' }}>PDF Onboarding</h4>
-                      <p className="text-xs mb-3" style={{ color: '#8899AA' }}>
-                        Genera la scheda PDF con QR di attivazione, contatti emergenza e guida Telegram per {op.name}.
-                      </p>
-                      <button onClick={() => generateOnboardingPdf({
-                        name: op.name,
-                        companyName: 'Costruzioni Sicure S.r.l.',
-                        preset: op.default_preset,
-                        configToken: (op as any).config_token_permanent || op.id,
-                        operatorId: op.id,
-                        contacts: (op.emergency_contacts || []).map((c: any) => ({
-                          name: c.name, sms: c.sms_enabled !== false,
-                          telegram: c.telegram_enabled !== false, call: c.call_enabled !== false,
-                        })),
-                      })}
-                        className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-bold text-white"
-                        style={{ backgroundColor: '#E63946' }}>
-                        <FileText size={16} /> Genera PDF Onboarding
-                      </button>
-                    </div>
-                    <div className="p-4 rounded-xl" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
-                      <h4 className="text-xs font-bold mb-2" style={{ color: '#8899AA' }}>ANTEPRIMA DATI</h4>
-                      <div className="space-y-1 text-xs">
-                        <div><span style={{ color: '#8899AA' }}>Nome:</span> <span style={{ color: '#ECEFF4' }}>{op.name}</span></div>
-                        <div><span style={{ color: '#8899AA' }}>Preset:</span> <span style={{ color: '#ECEFF4' }}>{op.default_preset}</span></div>
-                        <div><span style={{ color: '#8899AA' }}>Contatti:</span> <span style={{ color: '#ECEFF4' }}>{op.emergency_contacts?.length || 0}</span></div>
-                        <div><span style={{ color: '#8899AA' }}>Telegram link:</span> <span className="font-mono" style={{ color: '#3B82F6' }}>t.me/SoloSafe_bot?start=OP-{editId.substring(0, 8)}</span></div>
+                      </div>
+                      <div className="p-3 rounded-xl col-span-2" style={{ backgroundColor: '#0F1117', border: '1px solid #2A2D3E' }}>
+                        <div className="text-xs mb-1" style={{ color: '#8899AA' }}>GPS</div>
+                        {statusByOp[editBuffer.operatorId]?.last_lat ? (
+                          <div>
+                            <a
+                              href={`https://maps.google.com/?q=${statusByOp[editBuffer.operatorId]!.last_lat},${statusByOp[editBuffer.operatorId]!.last_lng}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-xs underline"
+                              style={{ color: '#3B82F6' }}>
+                              {statusByOp[editBuffer.operatorId]!.last_lat?.toFixed(5)}, {statusByOp[editBuffer.operatorId]!.last_lng?.toFixed(5)}
+                            </a>
+                            <div className="text-xs mt-1" style={{ color: '#ECEFF4' }}>
+                              {addressByOp[editBuffer.operatorId] || '⟳ Caricamento...'}
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-xs" style={{ color: '#8899AA' }}>—</span>
+                        )}
                       </div>
                     </div>
-                  </div>
-                );
-              })()}
+                  ) : (
+                    <p className="text-xs" style={{ color: '#8899AA' }}>Nessun dato disponibile</p>
+                  )}
+                </div>
+              )}
+
+              {/* PDF TAB */}
+              {editTab === 'pdf' && editBuffer.operatorId && (
+                <div className="space-y-4">
+                  <SectionTitle icon={<FileText size={16} />} title="PDF Onboarding" />
+                  <p className="text-xs" style={{ color: '#8899AA' }}>Genera PDF con QR e guida</p>
+                  <button
+                    onClick={() => {
+                      const op = operators.find(o => o.id === editBuffer.operatorId);
+                      if (op) {
+                        generateOnboardingPdf({
+                          name: op.name,
+                          companyName: 'Costruzioni Sicure S.r.l.',
+                          preset: op.default_preset,
+                          configToken: op.id,
+                          operatorId: op.id,
+                          contacts: (op.emergency_contacts || []).map((c: any) => ({
+                            name: c.name,
+                            sms: c.sms_enabled !== false,
+                            telegram: c.telegram_enabled !== false,
+                            call: c.call_enabled !== false,
+                          })),
+                        });
+                      }
+                    }}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold"
+                    style={{ backgroundColor: '#3B82F6', color: '#fff' }}>
+                    <FileText size={16} /> Scarica PDF
+                  </button>
+                </div>
+              )}
+
+              {formError && (
+                <div className="p-3 rounded-lg text-sm" style={{ backgroundColor: 'rgba(231,76,60,0.15)', color: '#E74C3C' }}>
+                  ❌ {formError}
+                </div>
+              )}
             </div>
 
-            {/* Save bar — only for anagrafica/turni/contacts tabs (alarms/cascade have own save) */}
-            {(formMode === 'create' || editTab === 'anagrafica' || editTab === 'turni' || editTab === 'contacts') && (
-              <div className="sticky bottom-0 px-5 py-4 flex items-center gap-3"
-                   style={{ backgroundColor: '#1A1D27', borderTop: '1px solid #2A2D3E' }}>
-                <button onClick={handleSave} disabled={saving}
-                        className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold transition-opacity hover:opacity-90 disabled:opacity-50"
-                        style={{ backgroundColor: '#E63946', color: '#fff' }}>
+            {/* Save Bar */}
+            <div className="sticky bottom-0 px-5 py-4 flex gap-3" style={{ backgroundColor: '#1A1D27', borderTop: '1px solid #2A2D3E' }}>
+              {/* FIX D: Hide save button for read-only status tab */}
+              {editTab !== 'status' && (
+                <button
+                  onClick={() => saveTab(editTab)}
+                  disabled={!dirtyTabs[editTab] || saving}
+                  className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold"
+                  style={{
+                    backgroundColor: dirtyTabs[editTab] ? '#E63946' : '#4A5568',
+                    color: '#fff',
+                    opacity: dirtyTabs[editTab] ? 1 : 0.5,
+                    cursor: dirtyTabs[editTab] ? 'pointer' : 'not-allowed',
+                  }}>
                   {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                  {saving ? 'Salvataggio...' : formMode === 'create' ? 'Crea Operatore' : 'Salva Modifiche'}
+                  Salva {editTab}
                 </button>
-                <button onClick={handleClose}
-                        className="px-4 py-2.5 rounded-lg text-sm font-medium"
-                        style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
-                  Annulla
-                </button>
-              </div>
-            )}
+              )}
+              <button
+                onClick={closePanel}
+                className={`${editTab === 'status' ? 'w-full' : ''} px-4 py-2.5 rounded-lg text-sm font-medium`}
+                style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
+                Chiudi
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* Unsaved changes dialog */}
+      {/* Unsaved Dialog */}
       {unsavedDialog && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(0, 0, 0, 0.7)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}>
           <div className="rounded-lg p-6 w-full max-w-sm" style={{ backgroundColor: '#1A1D27', border: '1px solid #2A2D3E' }}>
             <h3 className="text-base font-bold mb-2" style={{ color: '#ECEFF4' }}>⚠️ Modifiche non salvate</h3>
-            <p className="text-sm mb-6" style={{ color: '#8899AA' }}>
-              Hai modifiche non salvate. Vuoi salvarle?
-            </p>
+            <p className="text-sm mb-6" style={{ color: '#8899AA' }}>Hai modifiche in: {Object.entries(dirtyTabs).filter(([_, v]) => v).map(([k]) => k).join(', ')}</p>
             <div className="flex gap-3">
-              <button onClick={async () => {
-                setSaving(true);
-                try {
-                  await handleSave();
+              <button
+                onClick={async () => {
+                  setSaving(true);
+                  await handleSaveAndClose();
                   setUnsavedDialog(null);
-                  if (unsavedDialog.nextTab === 'anagrafica') {
-                    doCloseForm();
-                  } else {
+                  if (unsavedDialog.nextTab !== 'anagrafica') {
                     setEditTab(unsavedDialog.nextTab);
                   }
-                } finally {
                   setSaving(false);
-                }
-              }} disabled={saving}
-                className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-bold text-white"
-                style={{ backgroundColor: '#2ECC71' }}>
+                }}
+                disabled={saving}
+                className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-bold"
+                style={{ backgroundColor: '#2ECC71', color: '#fff' }}>
                 {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                 {unsavedDialog.nextTab === 'anagrafica' ? 'Salva e chiudi' : 'Salva e continua'}
               </button>
-              <button onClick={() => {
-                setUnsavedDialog(null);
-                if (unsavedDialog.nextTab === 'anagrafica') {
-                  doCloseForm();
-                } else {
-                  setEditTab(unsavedDialog.nextTab);
-                }
-              }}
+              <button
+                onClick={() => {
+                  setUnsavedDialog(null);
+                  if (unsavedDialog.nextTab === 'anagrafica') {
+                    doClosePanel();
+                  } else {
+                    setEditTab(unsavedDialog.nextTab);
+                  }
+                }}
                 className="flex-1 px-3 py-2.5 rounded-lg text-xs font-bold"
                 style={{ border: '1px solid #2A2D3E', color: '#ECEFF4' }}>
-                Scarta modifiche
+                Scarta
               </button>
-              <button onClick={() => setUnsavedDialog(null)}
-                className="px-3 py-2.5 rounded-lg text-xs font-bold"
-                style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
+              <button onClick={() => setUnsavedDialog(null)} className="px-3 py-2.5 rounded-lg text-xs font-bold" style={{ border: '1px solid #2A2D3E', color: '#8899AA' }}>
                 Annulla
               </button>
             </div>
@@ -1544,15 +1325,16 @@ export default function OperatorsView({ pendingOpen, onOpenHandled }: OperatorsV
         </div>
       )}
 
-      {/* Toast notifications */}
+      {/* Toast */}
       {toast && (
-        <div className="fixed bottom-4 right-4 px-4 py-3 rounded-lg text-sm font-bold"
-             style={{
-               backgroundColor: toast.type === 'success' ? '#2ECC71' : '#E74C3C',
-               color: '#fff',
-               zIndex: 9999,
-               animation: 'slideIn 0.3s ease-out',
-             }}>
+        <div
+          className="fixed bottom-4 right-4 px-4 py-3 rounded-lg text-sm font-bold"
+          style={{
+            backgroundColor: toast.type === 'success' ? '#2ECC71' : '#E74C3C',
+            color: '#fff',
+            zIndex: 9999,
+            animation: 'slideIn 0.3s ease-out',
+          }}>
           {toast.message}
         </div>
       )}
