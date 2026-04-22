@@ -21,6 +21,16 @@
 
 ---
 
+## 2026-04-22 2121 — Primo test metodo: SMOKE-DASH-01 verde
+
+- **Obiettivo**: verificare che il nuovo protocollo Claude Code funzioni e che la dashboard compili localmente.
+- **File toccati**: WORKLOG.md (questo aggiornamento). Nota: `node_modules/` popolato nel worktree ma non tracciato da git.
+- **Verificato con**: SMOKE-DASH-01 — `npm install` ok (1403 pacchetti), `npm run build` exit code 0, cartella `build/` generata (main.js 287.42 kB gzip).
+- **Esito**: completato
+- **Snapshot pre-sessione**: b0221d4
+- **Git push eseguito?**: no, solo commit locali (2 sul repo principale non ancora pushati)
+- **Note**: scoperto e risolto peccato originale del repo: cartella `public/` non era mai stata committata, recuperata dal VPS e committata su main (commit 5e30115).
+
 ## 2026-04-22 — Setup guardrails iniziali
 
 - **Obiettivo**: introdurre i 6 file di protocollo (`CLAUDE.md`, `CONTEXT.md`, `SMOKE_TESTS.md`, `WORKLOG.md`, `START_HERE.md`, `DEPLOY.md`) in ogni repo SoloSafe, per vincolare le sessioni future a un metodo disciplinato.
